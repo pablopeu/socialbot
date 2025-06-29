@@ -1,6 +1,6 @@
 # socialbot
 
-Instrucciones:
+**Instrucciones:**
 
 - subir el archivo php y config a un hosting.
 
@@ -16,7 +16,7 @@ Instrucciones:
 
 - En telegram, con botfather crear un bot y poner el token en el config.txt
 
-Finalmente
+**Finalmente**
 
 Una vez subidos los archivos, configurar el webhook de Telegram para que apunte a tu bot. 
 Visita esta URL en tu navegador (reemplaza los valores):
@@ -31,7 +31,7 @@ una vez que esto da TRUE
 
 deberia andar.
 
-Como se usa?
+**Como se usa?**
 
 Muy facil, le mandas el link de X o IG al bot y te devuelve las imagenes y/o videos del post, y desde ahi podes guardarlos y/o compartirlos.
 
