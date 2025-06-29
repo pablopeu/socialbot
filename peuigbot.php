@@ -3,7 +3,6 @@
 
 // Definir constantes y configuración
 define('LOG_FILE', __DIR__ . '/combined_bot.log');
-define('CFG_FILE', __DIR__ . '/config.txt');
 define('DEBUG_MODE', true); // Ajustar a false en producción
 define('COOKIE_JAR', __DIR__ . '/instagram_cookies.txt');
 define('THIRD_PARTY_API_BASE_URL', 'https://instagram-looter2.p.rapidapi.com');
@@ -15,27 +14,14 @@ function writeLog($message) {
     file_put_contents(LOG_FILE, "[{$timestamp}] {$message}\n", FILE_APPEND);
 }
 
-// Función para leer configuración
+// Función para leer configuración desde config.php
 function loadConfig() {
-    writeLog("Cargando configuración desde " . CFG_FILE);
-    if (!file_exists(CFG_FILE)) {
-        writeLog('ERROR: Archivo ' . CFG_FILE . ' no encontrado.');
-        error_log('Archivo ' . CFG_FILE . ' no encontrado');
+    writeLog("Cargando configuración desde " . __DIR__ . '/config.php');
+    $config = include __DIR__ . '/config.php';
+    if (!is_array($config)) {
+        writeLog('ERROR: Archivo config.php no devuelve un array.');
+        error_log('Archivo config.php no devuelve un array');
         return false;
-    }
-    
-    $config = [];
-    $lines = file(CFG_FILE, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-    
-    foreach ($lines as $line) {
-        $line = trim($line);
-        if (strpos($line, '#') === 0 || empty($line)) {
-            continue;
-        }
-        if (strpos($line, ':') !== false) {
-            list($key, $value) = explode(':', $line, 2);
-            $config[trim($key)] = trim($value);
-        }
     }
     writeLog("Configuración cargada: " . json_encode($config));
     return $config;
@@ -369,6 +355,7 @@ function handleTwitterLink($config, $chatId, $url) {
 
     sendTelegramMessage($config['token'], $chatId, "✅ ¡Listo! Enviados {$count} archivo(s).");
 }
+
 // Función principal para procesar el webhook
 function processWebhook() {
     writeLog("Iniciando procesamiento del webhook.");
