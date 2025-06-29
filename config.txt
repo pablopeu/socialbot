@@ -1,0 +1,4 @@
+token: aca va el token del bot de telegram
+third_party_api_key: aca va la api key de rapidapi
+LOG_FILE: bot.log
+TWITTER_BEARER: aca va el bearer token
