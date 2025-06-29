@@ -2,19 +2,21 @@
 
 Instrucciones:
 
-subir el archivo php y config a un hosting
-crear cuenta gratis en: https://rapidapi.com/
-suscribir a https://rapidapi.com/irrors-apis/api/instagram-looter2
-te da gratis 150 queries/mes
+- subir el archivo php y config a un hosting.
 
-crear una cuenta developer en X: https://developer.x.com
-una vez creada y aprobada van al default project en la columna de la izquierda y abajo del mismo les va a aparecer un numero que finaliza con su alias de X
-en esa seccion van a key and tokens y generan su bearer token, lo copian y lo pegan en el config.txt
+- crear cuenta gratis en: https://rapidapi.com/
 
+- suscribir a https://rapidapi.com/irrors-apis/api/instagram-looter2
+  te da gratis 150 queries/mes
 
-En telegram, con botfather crear un bot y poner el token en el config.txt
+- crear una cuenta developer en X: https://developer.x.com
+  una vez creada y aprobada van al default project en la columna de la izquierda y abajo del mismo les va a aparecer un numero que finaliza con su alias de X
+  en esa seccion van a key and tokens y generan su bearer token, lo copian y lo pegan en el config.txt
+  La api gratuita es muy restringida y permite pocos request seguidos y no mas de 100/mes, les va a servir para uso personal
 
-finalmente
+- En telegram, con botfather crear un bot y poner el token en el config.txt
+
+Finalmente
 
 Una vez subidos los archivos, configurar el webhook de Telegram para que apunte a tu bot. 
 Visita esta URL en tu navegador (reemplaza los valores):
