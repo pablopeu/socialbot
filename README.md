@@ -30,3 +30,8 @@ https://api.telegram.org/bot7435666643:AAE86MML8pGjvovfdhhhdT/setWebhook?url=htt
 una vez que esto da TRUE
 
 deberia andar.
+
+Como se usa?
+
+Muy facil, le mandas el link de X o IG al bot y te devuelve las imagenes y/o videos del post
+
