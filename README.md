@@ -12,7 +12,7 @@ Instrucciones:
 - crear una cuenta developer en X: https://developer.x.com
   una vez creada y aprobada van al default project en la columna de la izquierda y abajo del mismo les va a aparecer un numero que finaliza con su alias de X
   en esa seccion van a key and tokens y generan su bearer token, lo copian y lo pegan en el config.txt
-  La api gratuita es muy restringida y permite pocos request seguidos y no mas de 100/mes, les va a servir para uso personal
+  La api gratuita es muy restringida y permite pocos request seguidos y no mas de 100/mes, les va a servir para uso personal. El bot avisa si la api niega el request.
 
 - En telegram, con botfather crear un bot y poner el token en el config.txt
 
@@ -33,5 +33,7 @@ deberia andar.
 
 Como se usa?
 
-Muy facil, le mandas el link de X o IG al bot y te devuelve las imagenes y/o videos del post
+Muy facil, le mandas el link de X o IG al bot y te devuelve las imagenes y/o videos del post, y desde ahi podes guardarlos y/o compartirlos.
+
+
 
