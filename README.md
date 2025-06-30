@@ -14,7 +14,7 @@
   en esa seccion van a key and tokens y generan su bearer token, lo copian y lo pegan en el config.txt
   La api gratuita es muy restringida y permite pocos request seguidos y no mas de 100/mes, les va a servir para uso personal. El bot avisa si la api niega el request.
 
-- En telegram, con botfather crear un bot y poner el token en el config.txt
+- En telegram, con botfather crear un bot y poner el token en el config
 
 **Finalmente**
 
