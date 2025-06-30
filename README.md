@@ -27,9 +27,7 @@ por ejemplo:
 
 https://api.telegram.org/bot7435666643:AAE86MML8pGjvovfdhhhdT/setWebhook?url=https://midominio.com/bot.php
 
-una vez que esto da TRUE
-
-deberia andar.
+una vez que esto da TRUE deberia andar.
 
 **Como se usa?**
 
