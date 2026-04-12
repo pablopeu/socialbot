@@ -92,6 +92,16 @@ function getLinkType($url) {
     return false;
 }
 
+// Construye la URL del proxy del servicio para que Telegram pueda descargar el archivo
+// sin chocar con las restricciones de IP/cabeceras de los CDNs de Instagram y X.
+function buildProxyUrl($mediaUrl, $config) {
+    $proxyUrl = rtrim($config['ytdlp_service_url'], '/') . '/proxy?url=' . urlencode($mediaUrl);
+    if (!empty($config['ytdlp_secret'])) {
+        $proxyUrl .= '&secret=' . urlencode($config['ytdlp_secret']);
+    }
+    return $proxyUrl;
+}
+
 // Llama al microservicio yt-dlp y devuelve un array de items [{type, url}] o false
 function getMediaFromYtDlpService($url, $config) {
     if (empty($config['ytdlp_service_url'])) {
@@ -166,10 +176,11 @@ function handleMediaLink($config, $chatId, $url, $platform) {
     foreach ($mediaItems as $item) {
         $count++;
         $caption = $total_items > 1 ? "📸 Elemento {$count} de {$total_items}\n{$url}" : $url;
+        $proxiedUrl = buildProxyUrl($item['url'], $config);
         if ($item['type'] === 'image') {
-            sendTelegramPhoto($config['token'], $chatId, $item['url'], $caption);
+            sendTelegramPhoto($config['token'], $chatId, $proxiedUrl, $caption);
         } elseif ($item['type'] === 'video') {
-            sendTelegramVideo($config['token'], $chatId, $item['url'], $caption);
+            sendTelegramVideo($config['token'], $chatId, $proxiedUrl, $caption);
         }
         sleep(1); // Evitar límites de Telegram
     }

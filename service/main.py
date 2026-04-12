@@ -1,17 +1,33 @@
 import os
-from typing import Optional
+from typing import Optional, AsyncGenerator
 
 from fastapi import FastAPI, Query, HTTPException, Header
+from fastapi.responses import StreamingResponse
+import httpx
 import yt_dlp
 
 app = FastAPI()
 
 SECRET_TOKEN = os.environ.get("SECRET_TOKEN")
 
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Referer": "https://www.instagram.com/",
+}
+
+
+def _check_header_auth(x_secret: Optional[str]):
+    if SECRET_TOKEN and x_secret != SECRET_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _check_param_auth(secret: Optional[str]):
+    if SECRET_TOKEN and secret != SECRET_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
 
 def pick_best_mp4(formats: list) -> Optional[str]:
-    """Return the highest-resolution MP4 URL from a yt-dlp format list."""
-    # Prefer MP4 with a real video codec
     candidates = [
         f for f in formats
         if f.get("url")
@@ -19,7 +35,6 @@ def pick_best_mp4(formats: list) -> Optional[str]:
         and f.get("vcodec", "none") not in ("none", None, "")
     ]
     if not candidates:
-        # Fallback: any format with a video codec
         candidates = [
             f for f in formats
             if f.get("url") and f.get("vcodec", "none") not in ("none", None, "")
@@ -30,7 +45,6 @@ def pick_best_mp4(formats: list) -> Optional[str]:
 
 
 def entry_to_media(entry: dict) -> Optional[dict]:
-    """Convert a yt-dlp info entry to a {'type': ..., 'url': ...} dict."""
     formats = entry.get("formats") or []
 
     if formats:
@@ -55,9 +69,7 @@ def entry_to_media(entry: dict) -> Optional[dict]:
 
 @app.get("/extract")
 def extract(url: str = Query(...), x_secret: Optional[str] = Header(None)):
-    # Optional bearer auth
-    if SECRET_TOKEN and x_secret != SECRET_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    _check_header_auth(x_secret)
 
     ydl_opts = {
         "skip_download": True,
@@ -76,7 +88,6 @@ def extract(url: str = Query(...), x_secret: Optional[str] = Header(None)):
     if info is None:
         raise HTTPException(status_code=400, detail="No information extracted")
 
-    # Carousel / playlist vs single item
     if info.get("_type") == "playlist":
         entries = info.get("entries") or []
     else:
@@ -97,3 +108,33 @@ def extract(url: str = Query(...), x_secret: Optional[str] = Header(None)):
         raise HTTPException(status_code=400, detail="No media found in the given URL")
 
     return {"media": media}
+
+
+@app.get("/proxy")
+async def proxy(url: str = Query(...), secret: Optional[str] = Query(None)):
+    """Stream a CDN media file through this service so Telegram can fetch it
+    without hitting IP restrictions or missing required headers."""
+    _check_param_auth(secret)
+
+    client = httpx.AsyncClient(follow_redirects=True, timeout=60)
+    try:
+        req = client.build_request("GET", url, headers=BROWSER_HEADERS)
+        resp = await client.send(req, stream=True)
+    except Exception as e:
+        await client.aclose()
+        raise HTTPException(status_code=400, detail=f"Proxy fetch failed: {str(e)}")
+
+    if resp.status_code != 200:
+        await resp.aclose()
+        await client.aclose()
+        raise HTTPException(status_code=400, detail=f"CDN returned {resp.status_code}")
+
+    content_type = resp.headers.get("content-type", "application/octet-stream")
+
+    async def streamer() -> AsyncGenerator[bytes, None]:
+        async for chunk in resp.aiter_bytes(chunk_size=8192):
+            yield chunk
+        await resp.aclose()
+        await client.aclose()
+
+    return StreamingResponse(streamer(), media_type=content_type)
