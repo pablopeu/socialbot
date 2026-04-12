@@ -4,7 +4,7 @@ import os
 import tempfile
 from typing import Optional, AsyncGenerator
 
-from fastapi import FastAPI, Query, HTTPException, Header
+from fastapi import FastAPI, Query, HTTPException, Header, Request
 from fastapi.responses import StreamingResponse
 import httpx
 import yt_dlp
@@ -99,6 +99,16 @@ def entry_to_media(entry: dict) -> Optional[dict]:
 def debug_env():
     """List all environment variable names visible to the process."""
     return {"env_keys": sorted(os.environ.keys())}
+
+
+@app.get("/debug-headers")
+def debug_headers(request: Request):
+    """Echo back relevant headers to verify the PHP bot is sending cookies."""
+    return {
+        "x_ig_session_set": bool(request.headers.get("x-ig-session")),
+        "x_ig_csrf_set": bool(request.headers.get("x-ig-csrf")),
+        "x_secret_set": bool(request.headers.get("x-secret")),
+    }
 
 
 @app.get("/health")
