@@ -1,4 +1,5 @@
 import atexit
+import contextlib
 import os
 import tempfile
 from typing import Optional, AsyncGenerator
@@ -25,27 +26,23 @@ YDL_HTTP_HEADERS = {
     "Sec-Fetch-Mode": "navigate",
 }
 
-# Build a Netscape cookie file from individual Railway env vars.
-# IG_SESSIONID and IG_CSRFTOKEN are short strings with no special chars,
-# avoiding Railway's issues with long / encoded env var values.
-_COOKIE_FILE: Optional[str] = None
-
-_ig_sessionid = os.environ.get("IG_SESSIONID", "").strip()
-_ig_csrftoken = os.environ.get("IG_CSRFTOKEN", "").strip()
-
-if _ig_sessionid:
-    _cookie_lines = [
+@contextlib.contextmanager
+def _tmp_cookie_file(sessionid: str, csrftoken: str = ""):
+    """Write a temporary Netscape cookie file and yield its path."""
+    lines = [
         "# Netscape HTTP Cookie File",
-        f".instagram.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\t{_ig_sessionid}",
+        f".instagram.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\t{sessionid}",
     ]
-    if _ig_csrftoken:
-        _cookie_lines.append(
-            f".instagram.com\tTRUE\t/\tTRUE\t2147483647\tcsrftoken\t{_ig_csrftoken}"
-        )
-    _fd, _COOKIE_FILE = tempfile.mkstemp(suffix=".txt", prefix="ig_cookies_")
-    with os.fdopen(_fd, "w") as _f:
-        _f.write("\n".join(_cookie_lines) + "\n")
-    atexit.register(lambda: os.path.exists(_COOKIE_FILE) and os.unlink(_COOKIE_FILE))
+    if csrftoken:
+        lines.append(f".instagram.com\tTRUE\t/\tTRUE\t2147483647\tcsrftoken\t{csrftoken}")
+    fd, path = tempfile.mkstemp(suffix=".txt", prefix="ig_cookies_")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        yield path
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(path)
 
 
 def _check_header_auth(x_secret: Optional[str]):
@@ -107,16 +104,16 @@ def debug_env():
 @app.get("/health")
 def health():
     """Check service status and whether cookies are loaded."""
-    return {
-        "status": "ok",
-        "cookies_loaded": _COOKIE_FILE is not None,
-        "ig_sessionid_set": bool(os.environ.get("IG_SESSIONID", "")),
-        "ig_csrftoken_set": bool(os.environ.get("IG_CSRFTOKEN", "")),
-    }
+    return {"status": "ok"}
 
 
 @app.get("/extract")
-def extract(url: str = Query(...), x_secret: Optional[str] = Header(None)):
+def extract(
+    url: str = Query(...),
+    x_secret: Optional[str] = Header(None),
+    x_ig_session: Optional[str] = Header(None),
+    x_ig_csrf: Optional[str] = Header(None),
+):
     _check_header_auth(x_secret)
 
     ydl_opts = {
@@ -125,12 +122,20 @@ def extract(url: str = Query(...), x_secret: Optional[str] = Header(None)):
         "no_warnings": True,
         "http_headers": YDL_HTTP_HEADERS,
     }
-    if _COOKIE_FILE:
-        ydl_opts["cookiefile"] = _COOKIE_FILE
+
+    # Cookies sent by the PHP bot via headers take priority over env vars
+    cookie_ctx = (
+        _tmp_cookie_file(x_ig_session, x_ig_csrf or "")
+        if x_ig_session
+        else contextlib.nullcontext(None)
+    )
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        with cookie_ctx as cookie_path:
+            if cookie_path:
+                ydl_opts["cookiefile"] = cookie_path
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

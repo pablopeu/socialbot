@@ -116,6 +116,12 @@ function getMediaFromYtDlpService($url, $config) {
     if (!empty($config['ytdlp_secret'])) {
         $headers[] = 'X-Secret: ' . $config['ytdlp_secret'];
     }
+    if (!empty($config['ig_sessionid'])) {
+        $headers[] = 'X-Ig-Session: ' . $config['ig_sessionid'];
+    }
+    if (!empty($config['ig_csrftoken'])) {
+        $headers[] = 'X-Ig-Csrf: ' . $config['ig_csrftoken'];
+    }
 
     $ch = curl_init();
     curl_setopt($ch, CURLOPT_URL, $serviceUrl);
