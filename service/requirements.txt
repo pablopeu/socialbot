@@ -2,3 +2,4 @@ fastapi>=0.115.0
 uvicorn>=0.30.0
 yt-dlp
 httpx>=0.27.0
+instaloader>=4.13

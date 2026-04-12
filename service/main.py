@@ -1,7 +1,8 @@
-import atexit
 import base64
 import contextlib
+import http.cookiejar
 import os
+import re
 import shutil
 import tempfile
 import uuid
@@ -10,6 +11,7 @@ from typing import Optional, AsyncGenerator
 from fastapi import FastAPI, Query, HTTPException, Header, Request
 from fastapi.responses import StreamingResponse
 import httpx
+import instaloader
 import yt_dlp
 
 app = FastAPI()
@@ -28,6 +30,7 @@ YDL_HTTP_HEADERS = {
     "Accept-Language": "en-US,en;q=0.5",
     "Sec-Fetch-Mode": "navigate",
 }
+
 
 @contextlib.contextmanager
 def _tmp_cookie_file_raw(content: str):
@@ -107,6 +110,105 @@ def entry_to_media(entry: dict) -> Optional[dict]:
     return None
 
 
+# --- Instagram / instaloader helpers ---
+
+def _is_instagram_url(url: str) -> bool:
+    return "instagram.com" in url or "instagr.am" in url
+
+
+def _ig_shortcode_from_url(url: str) -> Optional[str]:
+    """Extract Instagram shortcode from a post/reel/tv URL."""
+    m = re.search(r"instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)", url)
+    return m.group(1) if m else None
+
+
+def _load_netscape_cookies_into_session(session, cookie_content: str):
+    """Parse a Netscape cookie file and load cookies into a requests.Session."""
+    jar = http.cookiejar.MozillaCookieJar()
+    for line in cookie_content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 7:
+            continue
+        domain, flag, path, secure, expires, name, value = parts[:7]
+        try:
+            exp = int(expires)
+        except (ValueError, TypeError):
+            exp = None
+        cookie = http.cookiejar.Cookie(
+            version=0,
+            name=name,
+            value=value,
+            port=None,
+            port_specified=False,
+            domain=domain,
+            domain_specified=bool(domain),
+            domain_initial_dot=domain.startswith("."),
+            path=path,
+            path_specified=bool(path),
+            secure=secure.upper() == "TRUE",
+            expires=exp,
+            discard=False,
+            comment=None,
+            comment_url=None,
+            rest={},
+        )
+        jar.set_cookie(cookie)
+    session.cookies.update(jar)
+
+
+def _ig_items_from_instaloader(url: str, cookie_content: Optional[str]) -> Optional[list]:
+    """Use instaloader to fetch media items from an Instagram post."""
+    shortcode = _ig_shortcode_from_url(url)
+    if not shortcode:
+        return None
+
+    L = instaloader.Instaloader(
+        download_pictures=False,
+        download_videos=False,
+        download_video_thumbnails=False,
+        download_geotags=False,
+        download_comments=False,
+        save_metadata=False,
+        quiet=True,
+    )
+
+    if cookie_content:
+        _load_netscape_cookies_into_session(L.context._session, cookie_content)
+
+    try:
+        post = instaloader.Post.from_shortcode(L.context, shortcode)
+    except Exception:
+        return None
+
+    items = []
+    if post.typename == "GraphSidecar":
+        for node in post.get_sidecar_nodes():
+            if node.is_video:
+                items.append({"type": "video", "url": node.video_url})
+            else:
+                items.append({"type": "image", "url": node.display_url})
+    elif post.is_video:
+        items.append({"type": "video", "url": post.video_url})
+    else:
+        items.append({"type": "image", "url": post.url})
+
+    return items if items else None
+
+
+def _decode_cookies(x_ig_cookies: Optional[str]) -> Optional[str]:
+    if not x_ig_cookies:
+        return None
+    try:
+        return base64.b64decode(x_ig_cookies).decode("utf-8")
+    except Exception:
+        return x_ig_cookies  # not base64, use as-is
+
+
+# --- API endpoints ---
+
 @app.get("/debug-env")
 def debug_env():
     """List all environment variable names visible to the process."""
@@ -137,6 +239,8 @@ def extract(
 ):
     _check_header_auth(x_secret)
 
+    cookie_content = _decode_cookies(x_ig_cookies)
+
     ydl_opts = {
         "skip_download": True,
         "quiet": True,
@@ -144,49 +248,50 @@ def extract(
         "http_headers": YDL_HTTP_HEADERS,
     }
 
-    # Full Netscape cookie file sent base64-encoded from the PHP bot
-    cookie_ctx = contextlib.nullcontext(None)
-    if x_ig_cookies:
-        try:
-            cookie_content = base64.b64decode(x_ig_cookies).decode("utf-8")
-        except Exception:
-            cookie_content = x_ig_cookies  # not base64, use as-is
-        cookie_ctx = _tmp_cookie_file_raw(cookie_content)
-
+    ytdlp_error = None
     try:
+        cookie_ctx = contextlib.nullcontext(None)
+        if cookie_content:
+            cookie_ctx = _tmp_cookie_file_raw(cookie_content)
+
         with cookie_ctx as cookie_path:
             if cookie_path:
                 ydl_opts["cookiefile"] = cookie_path
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
+
+        if info is None:
+            ytdlp_error = "No information extracted"
+        else:
+            if info.get("_type") == "playlist":
+                entries = info.get("entries") or []
+            else:
+                entries = [info]
+
+            media = []
+            for entry in entries:
+                if entry is None:
+                    continue
+                item = entry_to_media(entry)
+                if item:
+                    media.append(item)
+
+            if media:
+                return {"media": media}
+            ytdlp_error = "No media found in the given URL"
+
     except yt_dlp.utils.DownloadError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        ytdlp_error = str(e)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Extraction failed: {str(e)}")
+        ytdlp_error = f"Extraction failed: {str(e)}"
 
-    if info is None:
-        raise HTTPException(status_code=400, detail="No information extracted")
+    # Fallback to instaloader for Instagram URLs
+    if _is_instagram_url(url):
+        items = _ig_items_from_instaloader(url, cookie_content)
+        if items:
+            return {"media": items}
 
-    if info.get("_type") == "playlist":
-        entries = info.get("entries") or []
-    else:
-        entries = [info]
-
-    if not entries:
-        raise HTTPException(status_code=400, detail="No entries found")
-
-    media = []
-    for entry in entries:
-        if entry is None:
-            continue
-        item = entry_to_media(entry)
-        if item:
-            media.append(item)
-
-    if not media:
-        raise HTTPException(status_code=400, detail="No media found in the given URL")
-
-    return {"media": media}
+    raise HTTPException(status_code=400, detail=ytdlp_error or "No media found")
 
 
 @app.get("/download")
@@ -198,6 +303,8 @@ def download_media(
 ):
     """Download the Nth media item using yt-dlp (handles CDN auth) and stream it back."""
     _check_header_auth(x_secret)
+
+    cookie_content = _decode_cookies(x_ig_cookies)
 
     tmp_dir = f"/tmp/ytdl_{uuid.uuid4().hex}"
     os.makedirs(tmp_dir, exist_ok=True)
@@ -211,15 +318,14 @@ def download_media(
         "http_headers": YDL_HTTP_HEADERS,
     }
 
-    cookie_ctx = contextlib.nullcontext(None)
-    if x_ig_cookies:
-        try:
-            cookie_content = base64.b64decode(x_ig_cookies).decode("utf-8")
-        except Exception:
-            cookie_content = x_ig_cookies
-        cookie_ctx = _tmp_cookie_file_raw(cookie_content)
+    ytdlp_ok = False
+    ytdlp_error = None
 
     try:
+        cookie_ctx = contextlib.nullcontext(None)
+        if cookie_content:
+            cookie_ctx = _tmp_cookie_file_raw(cookie_content)
+
         with cookie_ctx as cookie_path:
             if cookie_path:
                 ydl_opts["cookiefile"] = cookie_path
@@ -227,10 +333,15 @@ def download_media(
                 ydl.download([url])
 
         files = [f for f in os.listdir(tmp_dir) if not f.endswith((".part", ".ytdl"))]
-        if not files:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            raise HTTPException(status_code=400, detail="No file downloaded")
+        if files:
+            ytdlp_ok = True
+        else:
+            ytdlp_error = "No file downloaded"
+    except Exception as e:
+        ytdlp_error = str(e)
 
+    if ytdlp_ok:
+        files = [f for f in os.listdir(tmp_dir) if not f.endswith((".part", ".ytdl"))]
         file_path = os.path.join(tmp_dir, sorted(files)[0])
         file_size = os.path.getsize(file_path)
         ext = file_path.rsplit(".", 1)[-1].lower()
@@ -255,12 +366,69 @@ def download_media(
             headers={"content-length": str(file_size)},
         )
 
-    except HTTPException:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise
-    except Exception as e:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise HTTPException(status_code=400, detail=f"Download failed: {str(e)}")
+    # yt-dlp failed — clean up and try instaloader fallback for Instagram
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if _is_instagram_url(url):
+        items = _ig_items_from_instaloader(url, cookie_content)
+        if items and index < len(items):
+            item = items[index]
+            cdn_url = item["url"]
+            item_type = item["type"]
+
+            suffix = ".mp4" if item_type == "video" else ".jpg"
+            fd, tmp_file = tempfile.mkstemp(suffix=suffix, prefix="ig_cdn_")
+            os.close(fd)
+
+            try:
+                with httpx.Client(follow_redirects=True, timeout=120) as client:
+                    with client.stream("GET", cdn_url, headers=BROWSER_HEADERS) as r:
+                        if r.status_code != 200:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Instagram CDN returned {r.status_code}",
+                            )
+                        with open(tmp_file, "wb") as f:
+                            for chunk in r.iter_bytes(65536):
+                                f.write(chunk)
+
+                file_size = os.path.getsize(tmp_file)
+                ext = tmp_file.rsplit(".", 1)[-1].lower()
+                mime_map = {
+                    "mp4": "video/mp4", "webm": "video/webm",
+                    "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                    "png": "image/png", "webp": "image/webp",
+                }
+                content_type = mime_map.get(ext, "application/octet-stream")
+
+                def ig_streamer():
+                    try:
+                        with open(tmp_file, "rb") as f:
+                            while chunk := f.read(65536):
+                                yield chunk
+                    finally:
+                        with contextlib.suppress(FileNotFoundError):
+                            os.unlink(tmp_file)
+
+                return StreamingResponse(
+                    ig_streamer(),
+                    media_type=content_type,
+                    headers={"content-length": str(file_size)},
+                )
+
+            except HTTPException:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(tmp_file)
+                raise
+            except Exception as e:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(tmp_file)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Instagram CDN download failed: {str(e)}",
+                )
+
+    raise HTTPException(status_code=400, detail=ytdlp_error or "Download failed")
 
 
 @app.get("/proxy")
