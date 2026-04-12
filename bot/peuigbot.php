@@ -24,7 +24,7 @@ function loadConfig() {
     return $config;
 }
 
-// Funciones para enviar mensajes, fotos y videos a Telegram
+// Función para enviar mensajes de texto a Telegram
 function sendTelegramMessage($token, $chatId, $message, $parseMode = null) {
     $url = "https://api.telegram.org/bot{$token}/sendMessage";
     $data = ['chat_id' => $chatId, 'text' => $message];
@@ -46,37 +46,72 @@ function sendTelegramMessage($token, $chatId, $message, $parseMode = null) {
     return $response;
 }
 
-function sendTelegramPhoto($token, $chatId, $photoUrl, $caption = '') {
-    $url = "https://api.telegram.org/bot{$token}/sendPhoto";
-    $data = ['chat_id' => $chatId, 'photo' => $photoUrl, 'caption' => $caption];
-    $ch = curl_init();
-    curl_setopt($ch, CURLOPT_URL, $url);
-    curl_setopt($ch, CURLOPT_POST, 1);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($data));
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    $response = curl_exec($ch);
-    if (curl_errno($ch)) {
-        writeLog("ERROR al enviar foto a Telegram: " . curl_error($ch));
-    } else {
-        writeLog("Respuesta de Telegram (foto): " . $response);
-    }
+// Descarga un archivo desde una URL CDN al disco local y devuelve ['path', 'content_type'] o false
+function downloadFile($url) {
+    writeLog("Descargando archivo: {$url}");
+    $tmpFile = tempnam(sys_get_temp_dir(), 'tgmedia_');
+    $fp = fopen($tmpFile, 'wb');
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_FILE           => $fp,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_TIMEOUT        => 180,
+        CURLOPT_HTTPHEADER     => [
+            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+            'Referer: https://www.instagram.com/',
+        ],
+    ]);
+    $success = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $contentType = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
     curl_close($ch);
-    return $response;
+    fclose($fp);
+
+    if (!$success || $httpCode !== 200) {
+        writeLog("ERROR al descargar (HTTP {$httpCode}): {$url}");
+        @unlink($tmpFile);
+        return false;
+    }
+    writeLog("Descargado OK ({$httpCode}), content-type: {$contentType}");
+    return ['path' => $tmpFile, 'content_type' => $contentType];
 }
 
-function sendTelegramVideo($token, $chatId, $videoUrl, $caption = '') {
-    $url = "https://api.telegram.org/bot{$token}/sendVideo";
-    $data = ['chat_id' => $chatId, 'video' => $videoUrl, 'caption' => $caption];
-    $ch = curl_init();
-    curl_setopt($ch, CURLOPT_URL, $url);
-    curl_setopt($ch, CURLOPT_POST, 1);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($data));
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+// Sube un archivo descargado a Telegram como foto o video
+function uploadToTelegram($token, $chatId, $type, $filePath, $contentType, $caption = '') {
+    if ($type === 'video') {
+        $apiMethod = 'sendVideo';
+        $fieldName  = 'video';
+        $mime       = $contentType ?: 'video/mp4';
+        $fileName   = 'video.mp4';
+    } else {
+        $apiMethod = 'sendPhoto';
+        $fieldName  = 'photo';
+        $mime       = $contentType ?: 'image/jpeg';
+        $fileName   = 'photo.jpg';
+    }
+
+    $url = "https://api.telegram.org/bot{$token}/{$apiMethod}";
+    $postData = [
+        'chat_id' => $chatId,
+        $fieldName => new CURLFile($filePath, $mime, $fileName),
+        'caption'  => $caption,
+    ];
+    if ($type === 'video') {
+        $postData['supports_streaming'] = 'true';
+    }
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_POST           => true,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => 120,
+        CURLOPT_POSTFIELDS     => $postData,
+    ]);
     $response = curl_exec($ch);
     if (curl_errno($ch)) {
-        writeLog("ERROR al enviar video a Telegram: " . curl_error($ch));
+        writeLog("ERROR al subir a Telegram ({$apiMethod}): " . curl_error($ch));
     } else {
-        writeLog("Respuesta de Telegram (video): " . $response);
+        writeLog("Respuesta Telegram ({$apiMethod}): " . $response);
     }
     curl_close($ch);
     return $response;
@@ -90,16 +125,6 @@ function getLinkType($url) {
         return 'twitter';
     }
     return false;
-}
-
-// Construye la URL del proxy del servicio para que Telegram pueda descargar el archivo
-// sin chocar con las restricciones de IP/cabeceras de los CDNs de Instagram y X.
-function buildProxyUrl($mediaUrl, $config) {
-    $proxyUrl = rtrim($config['ytdlp_service_url'], '/') . '/proxy?url=' . urlencode($mediaUrl);
-    if (!empty($config['ytdlp_secret'])) {
-        $proxyUrl .= '&secret=' . urlencode($config['ytdlp_secret']);
-    }
-    return $proxyUrl;
 }
 
 // Llama al microservicio yt-dlp y devuelve un array de items [{type, url}] o false
@@ -179,11 +204,13 @@ function handleMediaLink($config, $chatId, $url, $platform) {
     foreach ($mediaItems as $item) {
         $count++;
         $caption = $total_items > 1 ? "📸 Elemento {$count} de {$total_items}\n{$url}" : $url;
-        $proxiedUrl = buildProxyUrl($item['url'], $config);
-        if ($item['type'] === 'image') {
-            sendTelegramPhoto($config['token'], $chatId, $proxiedUrl, $caption);
-        } elseif ($item['type'] === 'video') {
-            sendTelegramVideo($config['token'], $chatId, $proxiedUrl, $caption);
+
+        $file = downloadFile($item['url']);
+        if ($file) {
+            uploadToTelegram($config['token'], $chatId, $item['type'], $file['path'], $file['content_type'], $caption);
+            @unlink($file['path']);
+        } else {
+            writeLog("ERROR: no se pudo descargar el item {$count}: " . $item['url']);
         }
         sleep(1); // Evitar límites de Telegram
     }
@@ -210,9 +237,23 @@ function processWebhook() {
     }
 
     $message = $update['message'];
-    $chatId = $message['chat']['id'];
-    $text = $message['text'] ?? '';
+    $chatId  = $message['chat']['id'];
+    $text    = $message['text'] ?? '';
     writeLog("Mensaje recibido (chatId: {$chatId}, texto: {$text})");
+
+    // Responder a Telegram inmediatamente para no hacer timeout
+    http_response_code(200);
+    header('Content-Type: text/plain');
+    header('Content-Length: 2');
+    echo 'OK';
+    if (function_exists('fastcgi_finish_request')) {
+        fastcgi_finish_request();
+    } else {
+        if (ob_get_level() > 0) ob_end_flush();
+        flush();
+    }
+    ignore_user_abort(true);
+    set_time_limit(300); // 5 minutos para descargar y subir archivos
 
     if ($text === '/start') {
         sendTelegramMessage(
@@ -220,8 +261,7 @@ function processWebhook() {
             $chatId,
             "¡Hola! 👋\n\nEnvíame un enlace de Instagram o Twitter/X y te descargaré las imágenes y videos del post."
         );
-        http_response_code(200);
-        exit('OK');
+        return;
     }
 
     $linkType = getLinkType($text);
@@ -231,14 +271,10 @@ function processWebhook() {
             $chatId,
             "Por favor, envía un enlace válido de Instagram o Twitter/X."
         );
-        http_response_code(200);
-        exit('OK');
+        return;
     }
 
     handleMediaLink($config, $chatId, $text, $linkType);
-
-    http_response_code(200);
-    exit('OK');
 }
 
 // Ejecutar el procesamiento del webhook
