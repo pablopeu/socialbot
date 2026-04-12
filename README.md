@@ -159,6 +159,6 @@ socialbot/
 ## Notas
 
 - Las cookies de Instagram expiran. Si el bot deja de funcionar con Instagram, repetir el paso 3.
-- El plan gratuito de Railway incluye suficientes horas para uso personal.
+- Railway ofrece un crédito inicial de $5 por 30 días. Después pasa a $1/mes no acumulable. Para uso personal liviano suele alcanzar, pero si se excede se cobra el excedente.
 - Si un post es privado y las cookies son de una cuenta que no lo sigue, no se puede descargar.
 - El log del bot se guarda en `combined_bot.log` junto al script PHP en el hosting.
