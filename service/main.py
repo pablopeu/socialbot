@@ -1,4 +1,5 @@
 import atexit
+import base64
 import os
 import tempfile
 from typing import Optional, AsyncGenerator
@@ -18,11 +19,24 @@ BROWSER_HEADERS = {
     "Referer": "https://www.instagram.com/",
 }
 
-# Write Instagram cookies to a temp file once at startup so yt-dlp can use them.
+YDL_HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Sec-Fetch-Mode": "navigate",
+}
+
+# Write Instagram cookies to a temp file at startup.
+# Accepts either raw Netscape format or base64-encoded content.
 _COOKIE_FILE: Optional[str] = None
 
-_cookie_content = os.environ.get("INSTAGRAM_COOKIES", "").strip()
-if _cookie_content:
+_cookie_raw = os.environ.get("INSTAGRAM_COOKIES", "").strip()
+if _cookie_raw:
+    try:
+        _cookie_content = base64.b64decode(_cookie_raw).decode("utf-8")
+    except Exception:
+        _cookie_content = _cookie_raw  # not base64, use as-is
+
     _fd, _COOKIE_FILE = tempfile.mkstemp(suffix=".txt", prefix="ig_cookies_")
     with os.fdopen(_fd, "w") as _f:
         _f.write(_cookie_content)
@@ -79,6 +93,15 @@ def entry_to_media(entry: dict) -> Optional[dict]:
     return None
 
 
+@app.get("/health")
+def health():
+    """Check service status and whether cookies are loaded."""
+    return {
+        "status": "ok",
+        "cookies_loaded": _COOKIE_FILE is not None,
+    }
+
+
 @app.get("/extract")
 def extract(url: str = Query(...), x_secret: Optional[str] = Header(None)):
     _check_header_auth(x_secret)
@@ -87,6 +110,7 @@ def extract(url: str = Query(...), x_secret: Optional[str] = Header(None)):
         "skip_download": True,
         "quiet": True,
         "no_warnings": True,
+        "http_headers": YDL_HTTP_HEADERS,
     }
     if _COOKIE_FILE:
         ydl_opts["cookiefile"] = _COOKIE_FILE
