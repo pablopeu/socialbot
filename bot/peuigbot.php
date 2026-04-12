@@ -116,11 +116,8 @@ function getMediaFromYtDlpService($url, $config) {
     if (!empty($config['ytdlp_secret'])) {
         $headers[] = 'X-Secret: ' . $config['ytdlp_secret'];
     }
-    if (!empty($config['ig_sessionid'])) {
-        $headers[] = 'X-Ig-Session: ' . $config['ig_sessionid'];
-    }
-    if (!empty($config['ig_csrftoken'])) {
-        $headers[] = 'X-Ig-Csrf: ' . $config['ig_csrftoken'];
+    if (!empty($config['ig_cookies'])) {
+        $headers[] = 'X-Ig-Cookies: ' . $config['ig_cookies'];
     }
 
     $ch = curl_init();

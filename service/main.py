@@ -1,4 +1,5 @@
 import atexit
+import base64
 import contextlib
 import os
 import tempfile
@@ -27,18 +28,12 @@ YDL_HTTP_HEADERS = {
 }
 
 @contextlib.contextmanager
-def _tmp_cookie_file(sessionid: str, csrftoken: str = ""):
-    """Write a temporary Netscape cookie file and yield its path."""
-    lines = [
-        "# Netscape HTTP Cookie File",
-        f".instagram.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\t{sessionid}",
-    ]
-    if csrftoken:
-        lines.append(f".instagram.com\tTRUE\t/\tTRUE\t2147483647\tcsrftoken\t{csrftoken}")
+def _tmp_cookie_file_raw(content: str):
+    """Write raw Netscape cookie file content to a temp file and yield its path."""
     fd, path = tempfile.mkstemp(suffix=".txt", prefix="ig_cookies_")
     try:
         with os.fdopen(fd, "w") as f:
-            f.write("\n".join(lines) + "\n")
+            f.write(content)
         yield path
     finally:
         with contextlib.suppress(FileNotFoundError):
@@ -121,8 +116,7 @@ def health():
 def extract(
     url: str = Query(...),
     x_secret: Optional[str] = Header(None),
-    x_ig_session: Optional[str] = Header(None),
-    x_ig_csrf: Optional[str] = Header(None),
+    x_ig_cookies: Optional[str] = Header(None),
 ):
     _check_header_auth(x_secret)
 
@@ -133,12 +127,14 @@ def extract(
         "http_headers": YDL_HTTP_HEADERS,
     }
 
-    # Cookies sent by the PHP bot via headers take priority over env vars
-    cookie_ctx = (
-        _tmp_cookie_file(x_ig_session, x_ig_csrf or "")
-        if x_ig_session
-        else contextlib.nullcontext(None)
-    )
+    # Full Netscape cookie file sent base64-encoded from the PHP bot
+    cookie_ctx = contextlib.nullcontext(None)
+    if x_ig_cookies:
+        try:
+            cookie_content = base64.b64decode(x_ig_cookies).decode("utf-8")
+        except Exception:
+            cookie_content = x_ig_cookies  # not base64, use as-is
+        cookie_ctx = _tmp_cookie_file_raw(cookie_content)
 
     try:
         with cookie_ctx as cookie_path:
