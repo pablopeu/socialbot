@@ -127,6 +127,17 @@ function getLinkType($url) {
     return false;
 }
 
+// Construye la URL del proxy en Railway para descargar un archivo CDN.
+// Las URLs de Twitter/IG tienen la IP de Railway quemada — hay que descargarlas
+// desde Railway, no desde shared hosting.
+function buildProxyUrl($mediaUrl, $config) {
+    $proxyUrl = rtrim($config['ytdlp_service_url'], '/') . '/proxy?url=' . urlencode($mediaUrl);
+    if (!empty($config['ytdlp_secret'])) {
+        $proxyUrl .= '&secret=' . urlencode($config['ytdlp_secret']);
+    }
+    return $proxyUrl;
+}
+
 // Llama al microservicio yt-dlp y devuelve un array de items [{type, url}] o false
 function getMediaFromYtDlpService($url, $config) {
     if (empty($config['ytdlp_service_url'])) {
@@ -205,7 +216,8 @@ function handleMediaLink($config, $chatId, $url, $platform) {
         $count++;
         $caption = $total_items > 1 ? "📸 Elemento {$count} de {$total_items}\n{$url}" : $url;
 
-        $file = downloadFile($item['url']);
+        // Descargar a través del proxy de Railway (misma IP que obtuvo la URL del CDN)
+        $file = downloadFile(buildProxyUrl($item['url'], $config));
         if ($file) {
             uploadToTelegram($config['token'], $chatId, $item['type'], $file['path'], $file['content_type'], $caption);
             @unlink($file['path']);

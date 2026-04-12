@@ -208,10 +208,16 @@ async def proxy(url: str = Query(...), secret: Optional[str] = Query(None)):
 
     content_type = resp.headers.get("content-type", "application/octet-stream")
 
+    # Forward Content-Length and Accept-Ranges so clients know the full file size
+    forward_headers = {}
+    for h in ("content-length", "accept-ranges", "content-disposition"):
+        if h in resp.headers:
+            forward_headers[h] = resp.headers[h]
+
     async def streamer() -> AsyncGenerator[bytes, None]:
-        async for chunk in resp.aiter_bytes(chunk_size=8192):
+        async for chunk in resp.aiter_bytes(chunk_size=65536):
             yield chunk
         await resp.aclose()
         await client.aclose()
 
-    return StreamingResponse(streamer(), media_type=content_type)
+    return StreamingResponse(streamer(), media_type=content_type, headers=forward_headers)
