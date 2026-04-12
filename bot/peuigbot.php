@@ -127,15 +127,45 @@ function getLinkType($url) {
     return false;
 }
 
-// Construye la URL del proxy en Railway para descargar un archivo CDN.
-// Las URLs de Twitter/IG tienen la IP de Railway quemada — hay que descargarlas
-// desde Railway, no desde shared hosting.
-function buildProxyUrl($mediaUrl, $config) {
-    $proxyUrl = rtrim($config['ytdlp_service_url'], '/') . '/proxy?url=' . urlencode($mediaUrl);
+// Descarga un item del post directamente en Railway con yt-dlp (que maneja la
+// autenticación CDN internamente) y lo guarda en un archivo temporal local.
+function downloadFromService($postUrl, $index, $config) {
+    $serviceUrl = rtrim($config['ytdlp_service_url'], '/') . '/download'
+        . '?url=' . urlencode($postUrl)
+        . '&index=' . intval($index);
+    writeLog("Descargando item {$index} desde servicio: {$serviceUrl}");
+
+    $tmpFile = tempnam(sys_get_temp_dir(), 'tgmedia_');
+    $fp = fopen($tmpFile, 'wb');
+
+    $headers = ['Accept: */*'];
     if (!empty($config['ytdlp_secret'])) {
-        $proxyUrl .= '&secret=' . urlencode($config['ytdlp_secret']);
+        $headers[] = 'X-Secret: ' . $config['ytdlp_secret'];
     }
-    return $proxyUrl;
+    if (!empty($config['ig_cookies'])) {
+        $headers[] = 'X-Ig-Cookies: ' . $config['ig_cookies'];
+    }
+
+    $ch = curl_init($serviceUrl);
+    curl_setopt_array($ch, [
+        CURLOPT_FILE           => $fp,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_TIMEOUT        => 300,
+        CURLOPT_HTTPHEADER     => $headers,
+    ]);
+    $success = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $contentType = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
+    curl_close($ch);
+    fclose($fp);
+
+    if (!$success || $httpCode !== 200) {
+        writeLog("ERROR al descargar desde servicio (HTTP {$httpCode})");
+        @unlink($tmpFile);
+        return false;
+    }
+    writeLog("Descargado OK, content-type: {$contentType}, tamaño: " . filesize($tmpFile));
+    return ['path' => $tmpFile, 'content_type' => $contentType];
 }
 
 // Llama al microservicio yt-dlp y devuelve un array de items [{type, url}] o false
@@ -211,18 +241,20 @@ function handleMediaLink($config, $chatId, $url, $platform) {
     }
 
     $total_items = count($mediaItems);
-    $count = 0;
-    foreach ($mediaItems as $item) {
-        $count++;
+    for ($i = 0; $i < $total_items; $i++) {
+        $item = $mediaItems[$i];
+        $count = $i + 1;
         $caption = $total_items > 1 ? "📸 Elemento {$count} de {$total_items}\n{$url}" : $url;
 
-        // Descargar a través del proxy de Railway (misma IP que obtuvo la URL del CDN)
-        $file = downloadFile(buildProxyUrl($item['url'], $config));
+        // yt-dlp descarga en Railway usando su sesión interna (evita restricciones CDN)
+        $file = downloadFromService($url, $i, $config);
         if ($file) {
-            uploadToTelegram($config['token'], $chatId, $item['type'], $file['path'], $file['content_type'], $caption);
+            // Determinar tipo por content-type del archivo descargado
+            $type = (strpos($file['content_type'], 'video') !== false) ? 'video' : 'image';
+            uploadToTelegram($config['token'], $chatId, $type, $file['path'], $file['content_type'], $caption);
             @unlink($file['path']);
         } else {
-            writeLog("ERROR: no se pudo descargar el item {$count}: " . $item['url']);
+            writeLog("ERROR: no se pudo descargar el item {$count}");
         }
         sleep(1); // Evitar límites de Telegram
     }

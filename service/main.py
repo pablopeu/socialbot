@@ -2,7 +2,9 @@ import atexit
 import base64
 import contextlib
 import os
+import shutil
 import tempfile
+import uuid
 from typing import Optional, AsyncGenerator
 
 from fastapi import FastAPI, Query, HTTPException, Header, Request
@@ -185,6 +187,80 @@ def extract(
         raise HTTPException(status_code=400, detail="No media found in the given URL")
 
     return {"media": media}
+
+
+@app.get("/download")
+def download_media(
+    url: str = Query(...),
+    index: int = Query(0),
+    x_secret: Optional[str] = Header(None),
+    x_ig_cookies: Optional[str] = Header(None),
+):
+    """Download the Nth media item using yt-dlp (handles CDN auth) and stream it back."""
+    _check_header_auth(x_secret)
+
+    tmp_dir = f"/tmp/ytdl_{uuid.uuid4().hex}"
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    ydl_opts = {
+        "outtmpl": os.path.join(tmp_dir, "%(id)s.%(ext)s"),
+        "format": "best[ext=mp4]/best",
+        "quiet": True,
+        "no_warnings": True,
+        "playlist_items": str(index + 1),
+        "http_headers": YDL_HTTP_HEADERS,
+    }
+
+    cookie_ctx = contextlib.nullcontext(None)
+    if x_ig_cookies:
+        try:
+            cookie_content = base64.b64decode(x_ig_cookies).decode("utf-8")
+        except Exception:
+            cookie_content = x_ig_cookies
+        cookie_ctx = _tmp_cookie_file_raw(cookie_content)
+
+    try:
+        with cookie_ctx as cookie_path:
+            if cookie_path:
+                ydl_opts["cookiefile"] = cookie_path
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+
+        files = [f for f in os.listdir(tmp_dir) if not f.endswith((".part", ".ytdl"))]
+        if not files:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise HTTPException(status_code=400, detail="No file downloaded")
+
+        file_path = os.path.join(tmp_dir, sorted(files)[0])
+        file_size = os.path.getsize(file_path)
+        ext = file_path.rsplit(".", 1)[-1].lower()
+        mime_map = {
+            "mp4": "video/mp4", "webm": "video/webm", "mov": "video/quicktime",
+            "jpg": "image/jpeg", "jpeg": "image/jpeg",
+            "png": "image/png", "webp": "image/webp",
+        }
+        content_type = mime_map.get(ext, "application/octet-stream")
+
+        def streamer():
+            try:
+                with open(file_path, "rb") as f:
+                    while chunk := f.read(65536):
+                        yield chunk
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        return StreamingResponse(
+            streamer(),
+            media_type=content_type,
+            headers={"content-length": str(file_size)},
+        )
+
+    except HTTPException:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+    except Exception as e:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=f"Download failed: {str(e)}")
 
 
 @app.get("/proxy")
