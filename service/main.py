@@ -1,4 +1,6 @@
+import atexit
 import os
+import tempfile
 from typing import Optional, AsyncGenerator
 
 from fastapi import FastAPI, Query, HTTPException, Header
@@ -15,6 +17,16 @@ BROWSER_HEADERS = {
     "Accept": "*/*",
     "Referer": "https://www.instagram.com/",
 }
+
+# Write Instagram cookies to a temp file once at startup so yt-dlp can use them.
+_COOKIE_FILE: Optional[str] = None
+
+_cookie_content = os.environ.get("INSTAGRAM_COOKIES", "").strip()
+if _cookie_content:
+    _fd, _COOKIE_FILE = tempfile.mkstemp(suffix=".txt", prefix="ig_cookies_")
+    with os.fdopen(_fd, "w") as _f:
+        _f.write(_cookie_content)
+    atexit.register(lambda: os.path.exists(_COOKIE_FILE) and os.unlink(_COOKIE_FILE))
 
 
 def _check_header_auth(x_secret: Optional[str]):
@@ -76,6 +88,8 @@ def extract(url: str = Query(...), x_secret: Optional[str] = Header(None)):
         "quiet": True,
         "no_warnings": True,
     }
+    if _COOKIE_FILE:
+        ydl_opts["cookiefile"] = _COOKIE_FILE
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
