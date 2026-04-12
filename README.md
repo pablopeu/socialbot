@@ -1,91 +1,133 @@
 # socialbot
 
-Bot de Telegram que descarga imágenes y videos de posts de Instagram y Twitter/X usando un microservicio Python con `yt-dlp`. No requiere APIs de pago ni cuentas de desarrollador.
+Bot de Telegram que descarga imágenes y videos de posts de **Instagram** y **Twitter/X** y los envía directamente al chat. No requiere APIs de pago ni cuentas de desarrollador.
 
-## Arquitectura
+## Cómo funciona
 
 ```
-[Telegram] → [bot/ en shared hosting PHP] → [service/ en Railway] → [yt-dlp]
+[Telegram] → [bot/ en hosting PHP] → [service/ en Railway] → [yt-dlp / instaloader]
 ```
 
-- **`bot/`** — script PHP que recibe el webhook de Telegram y envía los medios al usuario
-- **`service/`** — microservicio FastAPI/Python que extrae URLs de medios usando `yt-dlp`
+1. El usuario manda un link al bot de Telegram.
+2. El bot PHP llama al microservicio en Railway.
+3. Railway descarga el archivo usando `yt-dlp` (o `instaloader` como fallback para Instagram) y lo devuelve al bot.
+4. El bot sube el archivo directamente a Telegram.
+
+**`bot/`** — script PHP, corre en cualquier hosting compartido con cURL.  
+**`service/`** — microservicio FastAPI/Python, se despliega gratis en Railway.
 
 ---
 
-## 1. Microservicio Python en Railway
+## Paso 1 — Crear el bot de Telegram
+
+1. Hablar con [@BotFather](https://t.me/BotFather) en Telegram.
+2. Usar el comando `/newbot` y seguir las instrucciones.
+3. Guardar el **token** que entrega BotFather (formato `1234567890:AAExxxxxxx`).
+
+---
+
+## Paso 2 — Desplegar el microservicio en Railway
 
 ### Requisitos
 - Cuenta gratuita en [Railway](https://railway.app)
-- Este repositorio en tu GitHub
+- Este repositorio forkeado o clonado en tu GitHub
 
 ### Pasos
 
-1. En Railway, crear un nuevo proyecto → **Deploy from GitHub repo**
-2. Seleccionar este repositorio y elegir el directorio raíz: **`service/`**
-3. Railway detecta `requirements.txt` automáticamente e instala las dependencias
-4. El `Procfile` le indica a Railway cómo correr el servidor:
-   ```
-   web: uvicorn main:app --host 0.0.0.0 --port $PORT
-   ```
-5. (Opcional pero recomendado) En **Variables** del proyecto Railway, agregar:
-   ```
-   SECRET_TOKEN=una_clave_secreta_larga
-   ```
-   Si se define, el servicio exigirá el header `X-Secret: <token>` en cada request.
+1. En Railway: **New Project** → **Deploy from GitHub repo** → seleccionar este repo.
+2. Cuando Railway pida el directorio raíz, elegir **`service/`**.
+3. Railway detecta el `Procfile` y `requirements.txt` automáticamente.
+4. En la pestaña **Variables** del proyecto, agregar:
 
-6. Una vez desplegado, Railway te da una URL pública (ej. `https://socialbot-production.up.railway.app`). Anotarla.
+   | Variable | Valor | Obligatorio |
+   |---|---|---|
+   | `SECRET_TOKEN` | cualquier cadena larga y aleatoria | recomendado |
 
-### Verificar que funciona
+5. Una vez desplegado, ir a **Settings → Networking → Generate Domain** para obtener la URL pública.  
+   Ejemplo: `https://socialbot-production-xxxx.up.railway.app`
+
+### Verificar
+
 ```
-https://tu-servicio.railway.app/extract?url=https://www.instagram.com/p/SHORTCODE/
-```
-Debe devolver algo como:
-```json
-{"media": [{"type": "image", "url": "https://..."}]}
+curl https://tu-servicio.railway.app/health
+# → {"status":"ok"}
 ```
 
 ---
 
-## 2. Bot PHP en shared hosting
+## Paso 3 — Obtener cookies de Instagram (necesario para Instagram)
 
-### Requisitos
-- Hosting PHP con soporte de `curl` (cualquier hosting compartido básico)
-- Bot de Telegram creado con [@BotFather](https://t.me/BotFather)
+Instagram bloquea requests sin sesión. Hay que exportar las cookies del navegador con una sesión iniciada.
 
-### Pasos
-
-1. **Crear el bot en Telegram**: hablar con [@BotFather](https://t.me/BotFather), usar `/newbot` y guardar el token.
-
-2. **Editar `bot/config.php`** con tus datos:
-   ```php
-   <?php
-   return [
-       'token'             => 'TOKEN_DEL_BOT_DE_TELEGRAM',
-       'ytdlp_service_url' => 'https://tu-servicio.railway.app',
-       'ytdlp_secret'      => 'la_misma_clave_secreta_de_railway', // vacío si no usás SECRET_TOKEN
-   ];
+1. Instalar la extensión **Cookie-Editor** en Chrome o Firefox.
+2. Ir a [instagram.com](https://www.instagram.com) con tu cuenta iniciada.
+3. Abrir Cookie-Editor → **Export** → **Export as Netscape**.
+4. Copiar todo el contenido del archivo.
+5. Convertirlo a base64. En Linux/Mac:
+   ```bash
+   cat cookies.txt | base64 -w 0
    ```
+   En Windows (PowerShell):
+   ```powershell
+   [Convert]::ToBase64String([IO.File]::ReadAllBytes("cookies.txt"))
+   ```
+6. Guardar el resultado (una cadena larga en una sola línea).
 
-3. **Subir al hosting** los dos archivos de la carpeta `bot/`:
-   - `peuigbot.php`
-   - `config.php`
+> Para Twitter/X no se necesitan cookies.
 
-4. **Registrar el webhook** de Telegram visitando esta URL en el navegador (reemplazar los valores):
-   ```
-   https://api.telegram.org/bot[TOKEN]/setWebhook?url=https://[TU_DOMINIO]/peuigbot.php
-   ```
-   Por ejemplo:
-   ```
-   https://api.telegram.org/bot7435666643:AAE86MML8pGjvovfdhhhdT/setWebhook?url=https://midominio.com/peuigbot.php
-   ```
-   Si responde `{"ok":true}` el bot está activo.
+---
+
+## Paso 4 — Configurar el bot PHP
+
+Editar `bot/config.php` con tus datos:
+
+```php
+<?php
+return [
+    'token'             => 'TOKEN_DEL_BOT_DE_TELEGRAM',
+    'ytdlp_service_url' => 'https://tu-servicio.railway.app',
+    'ytdlp_secret'      => 'el_mismo_SECRET_TOKEN_de_railway',
+    'ig_cookies'        => 'PEGAR_ACA_EL_BASE64_DE_LAS_COOKIES',
+];
+```
+
+Si no usás `SECRET_TOKEN` en Railway, dejar `ytdlp_secret` como string vacío `''`.
+
+---
+
+## Paso 5 — Subir el bot al hosting
+
+Subir por FTP o panel de control los dos archivos de la carpeta `bot/`:
+
+```
+bot/peuigbot.php
+bot/config.php
+```
+
+Deben quedar accesibles por HTTPS, por ejemplo en `https://tudominio.com/peuigbot.php`.
+
+---
+
+## Paso 6 — Registrar el webhook
+
+Abrir esta URL en el navegador (reemplazar `TOKEN` y `TU_DOMINIO`):
+
+```
+https://api.telegram.org/botTOKEN/setWebhook?url=https://TU_DOMINIO/peuigbot.php
+```
+
+Ejemplo:
+```
+https://api.telegram.org/bot1234567890:AAExxxxxxx/setWebhook?url=https://midominio.com/peuigbot.php
+```
+
+Si responde `{"ok":true,"result":true}` el bot está activo.
 
 ---
 
 ## Uso
 
-Abrí el bot en Telegram y mandá un link de Instagram o Twitter/X:
+Abrir el bot en Telegram y mandar un link:
 
 ```
 https://www.instagram.com/p/SHORTCODE/
@@ -94,7 +136,7 @@ https://x.com/usuario/status/1234567890
 https://twitter.com/usuario/status/1234567890
 ```
 
-El bot responde con las imágenes y/o videos del post. Funciona con posts individuales, carousels y videos.
+El bot responde con las fotos y/o videos del post. Funciona con posts individuales, carousels y reels.
 
 ---
 
@@ -102,21 +144,21 @@ El bot responde con las imágenes y/o videos del post. Funciona con posts indivi
 
 ```
 socialbot/
-├── service/            ← subir a Railway
-│   ├── main.py         # FastAPI + yt-dlp
+├── bot/                 ← subir al hosting PHP
+│   ├── peuigbot.php     # webhook del bot de Telegram
+│   └── config.php       # token, URL del servicio, cookies
+├── service/             ← desplegar en Railway
+│   ├── main.py          # FastAPI + yt-dlp + instaloader
 │   ├── requirements.txt
 │   └── Procfile
-├── bot/                ← subir al shared hosting
-│   ├── peuigbot.php    # bot de Telegram
-│   └── config.php      # configuración (token, URL del servicio)
-└── README.md
+└── version_vieja/       ← versión original (referencia)
 ```
 
 ---
 
 ## Notas
 
-- El microservicio en Railway extrae URLs directas del CDN de Instagram/X sin descargar los archivos; el bot PHP luego le pasa esas URLs a Telegram, que las descarga por su cuenta.
-- El plan gratuito de Railway es suficiente para uso personal.
-- Si un post es privado, yt-dlp no podrá extraerlo y el bot lo informará.
-- El log del bot se guarda en `combined_bot.log` junto al script PHP.
+- Las cookies de Instagram expiran. Si el bot deja de funcionar con Instagram, repetir el paso 3.
+- El plan gratuito de Railway incluye suficientes horas para uso personal.
+- Si un post es privado y las cookies son de una cuenta que no lo sigue, no se puede descargar.
+- El log del bot se guarda en `combined_bot.log` junto al script PHP en el hosting.
