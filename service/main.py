@@ -93,6 +93,12 @@ def entry_to_media(entry: dict) -> Optional[dict]:
     return None
 
 
+@app.get("/debug-env")
+def debug_env():
+    """List all environment variable names visible to the process."""
+    return {"env_keys": sorted(os.environ.keys())}
+
+
 @app.get("/health")
 def health():
     """Check service status and whether cookies are loaded."""
