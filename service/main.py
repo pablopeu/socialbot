@@ -50,17 +50,32 @@ def _check_param_auth(secret: Optional[str]):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+def _is_direct(f: dict) -> bool:
+    """True if the format is a direct file (not HLS/DASH stream)."""
+    return (
+        f.get("protocol", "") not in ("m3u8", "m3u8_native", "m3u8_local", "dash")
+        and not (f.get("url") or "").endswith(".m3u8")
+        and not (f.get("url") or "").endswith(".mpd")
+    )
+
+
 def pick_best_mp4(formats: list) -> Optional[str]:
+    """Return the highest-resolution direct MP4 URL from a format list."""
+    # Direct MP4 with video codec
     candidates = [
         f for f in formats
         if f.get("url")
         and f.get("ext") == "mp4"
         and f.get("vcodec", "none") not in ("none", None, "")
+        and _is_direct(f)
     ]
     if not candidates:
+        # Fallback: any direct format with video codec
         candidates = [
             f for f in formats
-            if f.get("url") and f.get("vcodec", "none") not in ("none", None, "")
+            if f.get("url")
+            and f.get("vcodec", "none") not in ("none", None, "")
+            and _is_direct(f)
         ]
     if not candidates:
         return None
