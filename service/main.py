@@ -96,9 +96,12 @@ def entry_to_media(entry: dict) -> Optional[dict]:
 @app.get("/health")
 def health():
     """Check service status and whether cookies are loaded."""
+    raw = os.environ.get("INSTAGRAM_COOKIES", "")
     return {
         "status": "ok",
         "cookies_loaded": _COOKIE_FILE is not None,
+        "env_var_set": bool(raw),
+        "env_var_length": len(raw),
     }
 
 
