@@ -1,5 +1,4 @@
 import atexit
-import base64
 import os
 import tempfile
 from typing import Optional, AsyncGenerator
@@ -26,20 +25,26 @@ YDL_HTTP_HEADERS = {
     "Sec-Fetch-Mode": "navigate",
 }
 
-# Write Instagram cookies to a temp file at startup.
-# Accepts either raw Netscape format or base64-encoded content.
+# Build a Netscape cookie file from individual Railway env vars.
+# IG_SESSIONID and IG_CSRFTOKEN are short strings with no special chars,
+# avoiding Railway's issues with long / encoded env var values.
 _COOKIE_FILE: Optional[str] = None
 
-_cookie_raw = os.environ.get("INSTAGRAM_COOKIES", "").strip()
-if _cookie_raw:
-    try:
-        _cookie_content = base64.b64decode(_cookie_raw).decode("utf-8")
-    except Exception:
-        _cookie_content = _cookie_raw  # not base64, use as-is
+_ig_sessionid = os.environ.get("IG_SESSIONID", "").strip()
+_ig_csrftoken = os.environ.get("IG_CSRFTOKEN", "").strip()
 
+if _ig_sessionid:
+    _cookie_lines = [
+        "# Netscape HTTP Cookie File",
+        f".instagram.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\t{_ig_sessionid}",
+    ]
+    if _ig_csrftoken:
+        _cookie_lines.append(
+            f".instagram.com\tTRUE\t/\tTRUE\t2147483647\tcsrftoken\t{_ig_csrftoken}"
+        )
     _fd, _COOKIE_FILE = tempfile.mkstemp(suffix=".txt", prefix="ig_cookies_")
     with os.fdopen(_fd, "w") as _f:
-        _f.write(_cookie_content)
+        _f.write("\n".join(_cookie_lines) + "\n")
     atexit.register(lambda: os.path.exists(_COOKIE_FILE) and os.unlink(_COOKIE_FILE))
 
 
@@ -102,12 +107,11 @@ def debug_env():
 @app.get("/health")
 def health():
     """Check service status and whether cookies are loaded."""
-    raw = os.environ.get("INSTAGRAM_COOKIES", "")
     return {
         "status": "ok",
         "cookies_loaded": _COOKIE_FILE is not None,
-        "env_var_set": bool(raw),
-        "env_var_length": len(raw),
+        "ig_sessionid_set": bool(os.environ.get("IG_SESSIONID", "")),
+        "ig_csrftoken_set": bool(os.environ.get("IG_CSRFTOKEN", "")),
     }
 
 
