@@ -10,7 +10,7 @@ from telegram import Update
 from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-from downloader import download_media, is_instagram, is_twitter, is_facebook
+from downloader import download_media, is_instagram, is_twitter, is_facebook, is_tiktok
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -74,7 +74,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No tenés acceso. Contactate con el admin.")
         return
     await update.message.reply_text(
-        "Hola! Mandame un link de Instagram, Twitter/X o Facebook "
+        "Hola! Mandame un link de Instagram, Twitter/X, Facebook o TikTok "
         "y te bajo las fotos y videos del post."
     )
 
@@ -179,9 +179,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = (update.message.text or "").strip()
-    if not (is_instagram(text) or is_twitter(text) or is_facebook(text)):
+    if not (is_instagram(text) or is_twitter(text) or is_facebook(text) or is_tiktok(text)):
         await update.message.reply_text(
-            "Mandame un link de Instagram, Twitter/X o Facebook."
+            "Mandame un link de Instagram, Twitter/X, Facebook o TikTok."
         )
         return
 
@@ -189,6 +189,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         platform = "Instagram"
     elif is_facebook(text):
         platform = "Facebook"
+    elif is_tiktok(text):
+        platform = "TikTok"
     else:
         platform = "Twitter/X"
     logger.info(f"User {user.id} requested: {text}")
