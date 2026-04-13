@@ -1,3 +1,4 @@
+import html as html_lib
 import http.cookiejar
 import logging
 import os
@@ -21,6 +22,12 @@ BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     "Accept": "*/*",
     "Referer": "https://www.instagram.com/",
+}
+
+THREADS_BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Referer": "https://www.threads.com/",
 }
 
 YDL_HTTP_HEADERS = {
@@ -117,14 +124,16 @@ def _ig_cdn_items(url: str) -> Optional[list]:
     return items if items else None
 
 
-def _download_cdn_url(cdn_url: str, item_type: str) -> Optional[dict]:
+def _download_cdn_url(cdn_url: str, item_type: str, headers: dict = None) -> Optional[dict]:
     """Download a CDN URL to a temp file and return {type, path, mime}."""
     suffix = ".mp4" if item_type == "video" else ".jpg"
     fd, tmp_path = tempfile.mkstemp(suffix=suffix, prefix="ig_cdn_")
     os.close(fd)
+    if headers is None:
+        headers = BROWSER_HEADERS
     try:
         with httpx.Client(follow_redirects=True, timeout=120) as client:
-            with client.stream("GET", cdn_url, headers=BROWSER_HEADERS) as r:
+            with client.stream("GET", cdn_url, headers=headers) as r:
                 if r.status_code != 200:
                     os.unlink(tmp_path)
                     return None
@@ -162,23 +171,26 @@ def _threads_scrape(url: str) -> Optional[list]:
         logger.error(f"Threads fetch error: {e}")
         return None
 
+    def _clean(url: str) -> str:
+        return html_lib.unescape(url)
+
     # Video: look for video_versions array
     m = re.search(r'"video_versions"\s*:\s*\[\s*\{[^]]*?"url"\s*:\s*"(https://[^"]+)"', html)
     if m:
         logger.info("Threads scrape: found video_versions")
-        return [{"type": "video", "cdn_url": m.group(1)}]
+        return [{"type": "video", "cdn_url": _clean(m.group(1))}]
 
     # Video: og:video meta tag
     m = re.search(r'<meta[^>]+property=["\']og:video(?::url)?["\'][^>]+content=["\']([^"\']+)["\']', html)
     if m:
         logger.info("Threads scrape: found og:video")
-        return [{"type": "video", "cdn_url": m.group(1)}]
+        return [{"type": "video", "cdn_url": _clean(m.group(1))}]
 
     # Image: og:image meta tag
     m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html)
     if m:
         logger.info("Threads scrape: found og:image")
-        return [{"type": "image", "cdn_url": m.group(1)}]
+        return [{"type": "image", "cdn_url": _clean(m.group(1))}]
 
     logger.error("Threads scrape: no media found in page HTML")
     return None
@@ -265,7 +277,7 @@ def download_media(url: str) -> list:
         if cdn_items:
             results = []
             for item in cdn_items:
-                downloaded = _download_cdn_url(item["cdn_url"], item["type"])
+                downloaded = _download_cdn_url(item["cdn_url"], item["type"], THREADS_BROWSER_HEADERS)
                 if downloaded:
                     results.append(downloaded)
             return results
