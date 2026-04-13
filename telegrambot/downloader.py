@@ -50,6 +50,10 @@ def is_tiktok(url: str) -> bool:
     return "tiktok.com" in url or "vm.tiktok.com" in url
 
 
+def is_threads(url: str) -> bool:
+    return "threads.net" in url
+
+
 def _is_direct(f: dict) -> bool:
     return (
         f.get("protocol", "") not in ("m3u8", "m3u8_native", "m3u8_local", "dash")
