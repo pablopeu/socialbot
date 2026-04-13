@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import uuid
 from typing import Optional
@@ -190,6 +191,36 @@ def download_media(url: str) -> list:
         return results
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # gallery-dl fallback for Threads
+    if is_threads(url):
+        tmp_dir = f"/tmp/bot_{uuid.uuid4().hex}"
+        os.makedirs(tmp_dir, exist_ok=True)
+        cmd = ["gallery-dl", "--dest", tmp_dir, "--filename", "{num:>02}.{extension}", url]
+        if os.path.exists(THREADS_COOKIES_PATH):
+            cmd += ["--cookies", THREADS_COOKIES_PATH]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if result.returncode != 0:
+                logger.error(f"gallery-dl error: {result.stderr.strip()}")
+            else:
+                files = sorted([
+                    f for f in os.listdir(tmp_dir)
+                    if not f.endswith((".part", ".ytdl"))
+                ])
+                if files:
+                    results = []
+                    for fname in files:
+                        fpath = os.path.join(tmp_dir, fname)
+                        ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
+                        mime = MIME_MAP.get(ext, "application/octet-stream")
+                        ftype = "video" if "video" in mime else "image"
+                        results.append({"type": ftype, "path": fpath, "mime": mime, "_dir": tmp_dir})
+                    return results
+        except Exception as e:
+            logger.error(f"gallery-dl exception: {e}")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return []
 
     # Instaloader fallback for Instagram
     if is_instagram(url):
