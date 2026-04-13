@@ -42,6 +42,10 @@ def is_twitter(url: str) -> bool:
     return "twitter.com" in url or "x.com" in url
 
 
+def is_facebook(url: str) -> bool:
+    return "facebook.com" in url or "fb.watch" in url
+
+
 def _is_direct(f: dict) -> bool:
     return (
         f.get("protocol", "") not in ("m3u8", "m3u8_native", "m3u8_local", "dash")
