@@ -4,6 +4,7 @@ import logging
 import os
 import shutil
 from pathlib import Path
+from typing import Optional
 
 from telegram import Update
 from telegram.error import TelegramError
@@ -31,16 +32,42 @@ def load_token() -> str:
         return json.load(f)["token"]
 
 
-def is_allowed(user_id: int) -> bool:
+def _parse_allowed_users() -> list[tuple[str, str]]:
+    """
+    Parse allowed_users.txt and return list of (id, comment) tuples.
+    Supports inline comments: '123456789  # Pablo'
+    Lines starting with # are skipped entirely.
+    """
     if not ALLOWED_USERS_PATH.exists():
-        return False
-    allowed = {
-        line.strip()
-        for line in ALLOWED_USERS_PATH.read_text().splitlines()
-        if line.strip() and not line.startswith("#")
-    }
-    return str(user_id) in allowed
+        return []
+    result = []
+    for line in ALLOWED_USERS_PATH.read_text().splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split("#", 1)
+        user_id = parts[0].strip()
+        comment = parts[1].strip() if len(parts) > 1 else ""
+        if user_id.isdigit():
+            result.append((user_id, comment))
+    return result
 
+
+def is_allowed(user_id: int) -> bool:
+    return any(uid == str(user_id) for uid, _ in _parse_allowed_users())
+
+
+def get_admin_id() -> Optional[int]:
+    """The first valid entry in allowed_users.txt is the admin."""
+    entries = _parse_allowed_users()
+    return int(entries[0][0]) if entries else None
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id == get_admin_id()
+
+
+# --- Handlers ---
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
@@ -50,6 +77,99 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Hola! Mandame un link de Instagram o Twitter/X "
         "y te bajo las fotos y videos del post."
     )
+
+
+async def cmd_agregar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Solo el admin puede usar este comando.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Uso: /agregar ID [nombre]")
+        return
+
+    new_id = context.args[0].strip()
+    if not new_id.isdigit():
+        await update.message.reply_text("El ID debe ser un número. Ejemplo: /agregar 123456789 Juan")
+        return
+
+    if is_allowed(int(new_id)):
+        await update.message.reply_text(f"El usuario {new_id} ya está en la lista.")
+        return
+
+    comment = " ".join(context.args[1:]) if len(context.args) > 1 else ""
+    line = f"{new_id}  # {comment}" if comment else new_id
+
+    with open(ALLOWED_USERS_PATH, "a") as f:
+        f.write(f"\n{line}")
+
+    msg = f"Usuario {new_id} agregado."
+    if comment:
+        msg += f" ({comment})"
+    await update.message.reply_text(msg)
+    logger.info(f"Admin agregó usuario {new_id} ({comment})")
+
+
+async def cmd_borrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Solo el admin puede usar este comando.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Uso: /borrar ID")
+        return
+
+    target_id = context.args[0].strip()
+    if not target_id.isdigit():
+        await update.message.reply_text("El ID debe ser un número. Ejemplo: /borrar 123456789")
+        return
+
+    if int(target_id) == get_admin_id():
+        await update.message.reply_text("No podés borrar al admin.")
+        return
+
+    if not is_allowed(int(target_id)):
+        await update.message.reply_text(f"El usuario {target_id} no está en la lista.")
+        return
+
+    # Rewrite file preserving comments and order, removing the target line
+    lines = ALLOWED_USERS_PATH.read_text().splitlines()
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            new_lines.append(line)
+            continue
+        line_id = stripped.split("#")[0].strip()
+        if line_id == target_id:
+            continue  # drop this line
+        new_lines.append(line)
+
+    ALLOWED_USERS_PATH.write_text("\n".join(new_lines))
+    await update.message.reply_text(f"Usuario {target_id} eliminado.")
+    logger.info(f"Admin eliminó usuario {target_id}")
+
+
+async def cmd_lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Solo el admin puede usar este comando.")
+        return
+
+    entries = _parse_allowed_users()
+    if not entries:
+        await update.message.reply_text("La lista está vacía.")
+        return
+
+    lines = ["*Usuarios permitidos:*"]
+    for i, (uid, comment) in enumerate(entries):
+        label = f"_{comment}_" if comment else "_sin nombre_"
+        tag = " (admin)" if i == 0 else ""
+        lines.append(f"• `{uid}` — {label}{tag}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -132,6 +252,9 @@ def main():
     token = load_token()
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("agregar", cmd_agregar))
+    app.add_handler(CommandHandler("borrar", cmd_borrar))
+    app.add_handler(CommandHandler("lista", cmd_lista))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     logger.info("Bot iniciado con polling.")
     app.run_polling(drop_pending_updates=True)

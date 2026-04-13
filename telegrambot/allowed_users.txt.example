@@ -1,6 +1,9 @@
 # Un ID de Telegram por línea.
 # Para saber tu ID escribile a @userinfobot en Telegram.
 # Las líneas que empiezan con # son comentarios y se ignoran.
+# Podés agregar un nombre después del # en la misma línea.
+# El PRIMER usuario de la lista es el admin.
 
-123456789
-987654321
+123456789  # Pablo (admin)
+987654321  # María
+555444333  # Juan
