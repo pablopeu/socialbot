@@ -147,10 +147,6 @@ def download_media(url: str) -> list:
     Returns list of: {'type': 'video'|'image', 'path': str, 'mime': str}
     Caller is responsible for deleting the temp files.
     """
-    # yt-dlp only supports threads.net, not the newer threads.com domain
-    if "threads.com" in url:
-        url = url.replace("threads.com", "threads.net")
-
     tmp_dir = f"/tmp/bot_{uuid.uuid4().hex}"
     os.makedirs(tmp_dir, exist_ok=True)
 
