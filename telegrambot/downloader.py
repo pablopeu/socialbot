@@ -151,6 +151,46 @@ def _download_cdn_url(cdn_url: str, item_type: str, headers: dict = None) -> Opt
         return None
 
 
+def _facebook_scrape(url: str) -> Optional[list]:
+    """Extract media from a public Facebook post by scraping the page HTML."""
+    fetch_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+    }
+    try:
+        with httpx.Client(follow_redirects=True, timeout=30) as client:
+            r = client.get(url, headers=fetch_headers)
+        if r.status_code != 200:
+            logger.error(f"Facebook page HTTP {r.status_code}")
+            return None
+        html = r.text.replace("\\u0026", "&").replace("\\u003C", "<").replace("\\u003E", ">")
+    except Exception as e:
+        logger.error(f"Facebook fetch error: {e}")
+        return None
+
+    def _clean(u: str) -> str:
+        return html_lib.unescape(u)
+
+    # Video: og:video meta tag
+    m = re.search(r'<meta[^>]+property=["\']og:video(?::url)?["\'][^>]+content=["\']([^"\']+)["\']', html)
+    if m:
+        logger.info("Facebook scrape: found og:video")
+        return [{"type": "video", "cdn_url": _clean(m.group(1))}]
+
+    # Image: og:image meta tag
+    m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html)
+    if m:
+        logger.info("Facebook scrape: found og:image")
+        return [{"type": "image", "cdn_url": _clean(m.group(1))}]
+
+    logger.error("Facebook scrape: no media found in page HTML")
+    return None
+
+
 def _threads_scrape(url: str) -> Optional[list]:
     """Extract media from a public Threads post by scraping the page HTML."""
     fetch_headers = {
@@ -281,6 +321,18 @@ def download_media(url: str) -> list:
             results = []
             for item in cdn_items:
                 downloaded = _download_cdn_url(item["cdn_url"], item["type"], THREADS_BROWSER_HEADERS)
+                if downloaded:
+                    results.append(downloaded)
+            return results
+        return []
+
+    # httpx scrape fallback for Facebook public posts
+    if is_facebook(url):
+        cdn_items = _facebook_scrape(url)
+        if cdn_items:
+            results = []
+            for item in cdn_items:
+                downloaded = _download_cdn_url(item["cdn_url"], item["type"])
                 if downloaded:
                     results.append(downloaded)
             return results
