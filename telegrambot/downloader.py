@@ -51,7 +51,7 @@ def is_tiktok(url: str) -> bool:
 
 
 def is_threads(url: str) -> bool:
-    return "threads.net" in url
+    return "threads.net" in url or "threads.com" in url
 
 
 def _is_direct(f: dict) -> bool:
