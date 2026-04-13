@@ -1,10 +1,13 @@
 import http.cookiejar
+import logging
 import os
 import re
 import shutil
 import tempfile
 import uuid
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 import httpx
 import instaloader
@@ -169,8 +172,8 @@ def download_media(url: str) -> list:
             if not f.endswith((".part", ".ytdl"))
         ])
         ytdlp_ok = bool(files)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"yt-dlp error for {url}: {e}")
 
     if ytdlp_ok:
         results = []
