@@ -196,7 +196,7 @@ def download_media(url: str) -> list:
     if is_threads(url):
         tmp_dir = f"/tmp/bot_{uuid.uuid4().hex}"
         os.makedirs(tmp_dir, exist_ok=True)
-        cmd = ["gallery-dl", "--dest", tmp_dir, "--filename", "{num:>02}.{extension}", url]
+        cmd = ["python3", "-m", "gallery_dl", "--dest", tmp_dir, "--filename", "{num:>02}.{extension}", url]
         if os.path.exists(THREADS_COOKIES_PATH):
             cmd += ["--cookies", THREADS_COOKIES_PATH]
         try:
