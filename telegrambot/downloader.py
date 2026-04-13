@@ -17,6 +17,7 @@ import yt_dlp
 
 COOKIES_PATH = os.path.join(os.path.dirname(__file__), "cookies.txt")
 THREADS_COOKIES_PATH = os.path.join(os.path.dirname(__file__), "threads_cookies.txt")
+FACEBOOK_COOKIES_PATH = os.path.join(os.path.dirname(__file__), "facebook_cookies.txt")
 
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -216,6 +217,8 @@ def download_media(url: str) -> list:
     # Pick the right cookies file for the platform
     if is_threads(url) and os.path.exists(THREADS_COOKIES_PATH):
         ydl_opts["cookiefile"] = THREADS_COOKIES_PATH
+    elif is_facebook(url) and os.path.exists(FACEBOOK_COOKIES_PATH):
+        ydl_opts["cookiefile"] = FACEBOOK_COOKIES_PATH
     elif os.path.exists(COOKIES_PATH):
         ydl_opts["cookiefile"] = COOKIES_PATH
 
