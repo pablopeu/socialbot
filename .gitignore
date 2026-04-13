@@ -1,0 +1,8 @@
+telegrambot/config.json
+telegrambot/allowed_users.txt
+telegrambot/cookies.txt
+telegrambot/bot.log
+bot/config.php
+combined_bot.log
+__pycache__/
+*.pyc

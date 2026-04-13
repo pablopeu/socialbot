@@ -1,0 +1,16 @@
+[Unit]
+Description=Socialbot Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/socialbot/telegrambot
+ExecStart=/usr/bin/python3 /home/ubuntu/socialbot/telegrambot/bot.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

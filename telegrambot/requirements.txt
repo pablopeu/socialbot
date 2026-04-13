@@ -1,0 +1,4 @@
+python-telegram-bot[all]>=21.0
+yt-dlp
+instaloader>=4.13
+httpx>=0.27.0
