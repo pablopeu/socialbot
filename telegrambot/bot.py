@@ -44,7 +44,7 @@ def is_allowed(user_id: int) -> bool:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
-        await update.message.reply_text("No tenés acceso a este bot.")
+        await update.message.reply_text("No tenés acceso. Contactate con el admin.")
         return
     await update.message.reply_text(
         "Hola! Mandame un link de Instagram o Twitter/X "
@@ -55,7 +55,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_allowed(user.id):
-        await update.message.reply_text("No tenés acceso a este bot.")
+        await update.message.reply_text("No tenés acceso. Contactate con el admin.")
         return
 
     text = (update.message.text or "").strip()
