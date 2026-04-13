@@ -46,17 +46,28 @@ ssh -i Oracle\ ssh-key.key ubuntu@IP_PUBLICA
 
 ---
 
-## Paso 3 — Configurar ZeroTier (SSH seguro)
+## Paso 3 — Configurar VPN para SSH seguro
 
-Instalar ZeroTier en la VM y en tu PC para acceder por SSH sin exponer el puerto 22 a internet.
+Instalar una VPN mesh en la VM y en tu PC para acceder por SSH sin exponer el puerto 22 a internet. Cualquiera de estas opciones funciona:
 
-**En la VM:**
+- **ZeroTier** — [zerotier.com](https://www.zerotier.com), free hasta 25 dispositivos
+- **Tailscale** — [tailscale.com](https://tailscale.com), free hasta 3 usuarios
+
+**Ejemplo con ZeroTier:**
 ```bash
 curl -s https://install.zerotier.com | sudo bash
 sudo zerotier-cli join TU_NETWORK_ID
 ```
 
-Autorizar el dispositivo en [my.zerotier.com](https://my.zerotier.com) y anotar la IP ZeroTier asignada (ej. `10.241.x.x`).
+Autorizar el dispositivo en [my.zerotier.com](https://my.zerotier.com) y anotar la IP asignada (ej. `10.241.x.x`).
+
+**Ejemplo con Tailscale:**
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+```
+
+Anotar la IP Tailscale asignada (ej. `100.x.x.x`).
 
 **Configurar firewall:**
 ```bash
