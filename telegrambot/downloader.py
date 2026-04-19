@@ -69,6 +69,17 @@ class DownloadError(Exception):
     """User-facing download error."""
 
 
+def instagram_status() -> dict:
+    remaining = _instagram_circuit_remaining()
+    return {
+        "cooldown_seconds": INSTAGRAM_COOLDOWN_SECONDS,
+        "circuit_open": remaining > 0,
+        "remaining_seconds": int(remaining),
+        "fixer_hosts": list(INSTAGRAM_FIXER_HOSTS),
+        "fixer_verify_ssl": INSTAGRAM_FIXER_VERIFY_SSL,
+    }
+
+
 def _format_seconds(seconds: float) -> str:
     total = max(1, int(seconds))
     minutes, secs = divmod(total, 60)
@@ -229,19 +240,19 @@ def _ig_download_via_fixers(url: str) -> list:
             ) as client:
                 r = client.get(fixer_url, headers=YDL_HTTP_HEADERS)
         except Exception as e:
-            logger.warning(f"Instagram fixer {host} request failed: {e}")
+            logger.debug(f"Instagram fixer {host} request failed: {e}")
             continue
 
         if r.status_code != 200:
-            logger.warning(f"Instagram fixer {host} returned HTTP {r.status_code}")
+            logger.debug(f"Instagram fixer {host} returned HTTP {r.status_code}")
             continue
 
         items = _extract_og_media_items(r.text)
         if not items:
-            logger.info(f"Instagram fixer {host} returned no og media tags")
+            logger.debug(f"Instagram fixer {host} returned no og media tags")
             continue
         if prefer_video and not any(item["type"] == "video" for item in items):
-            logger.info(f"Instagram fixer {host} returned only images for reel/tv")
+            logger.debug(f"Instagram fixer {host} returned only images for reel/tv")
             continue
 
         results = []
@@ -256,7 +267,7 @@ def _ig_download_via_fixers(url: str) -> list:
             if downloaded:
                 results.append(downloaded)
             elif status_code in (401, 403, 429):
-                logger.warning(
+                logger.debug(
                     "Instagram fixer %s exposed media URL but CDN returned HTTP %s",
                     host,
                     status_code,
@@ -264,14 +275,14 @@ def _ig_download_via_fixers(url: str) -> list:
                 results = []
                 break
             elif status_code:
-                logger.info(
+                logger.debug(
                     "Instagram fixer %s media download returned HTTP %s for %s",
                     host,
                     status_code,
                     item["type"],
                 )
             else:
-                logger.info(
+                logger.debug(
                     "Instagram fixer %s media download failed without HTTP status for %s",
                     host,
                     item["type"],

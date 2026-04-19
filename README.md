@@ -168,6 +168,12 @@ sudo systemctl restart socialbot
 cd ~/socialbot && git pull && sudo systemctl restart socialbot
 ```
 
+Comandos Telegram para el admin:
+- `/lista`
+- `/agregar ID [nombre]`
+- `/borrar ID`
+- `/instagram_status`
+
 ---
 
 ## Notas
@@ -176,5 +182,6 @@ cd ~/socialbot && git pull && sudo systemctl restart socialbot
 - El bot activa un cooldown automático de 15 minutos después de un bloqueo de Instagram para no seguir golpeando la misma IP. Se puede cambiar con `SOCIALBOT_INSTAGRAM_COOLDOWN_SECONDS`.
 - Cuando el acceso directo a Instagram falla, el bot prueba una cadena de fixers externos. Se puede cambiar con `SOCIALBOT_INSTAGRAM_FIXER_HOSTS`.
 - Si Instagram falla incluso después de probar todos los fixers, el bot avisa al admin configurado una sola vez por día.
+- El bot baja el ruido de logs HTTP de librerías externas; para diagnosticar Instagram usá `/instagram_status` y los logs propios del servicio.
 - Oracle Cloud Always Free no tiene límite de tiempo ni costo mientras se use el shape gratuito.
 - Telegram tiene un límite de 50 MB por archivo. Videos más grandes no se pueden enviar.

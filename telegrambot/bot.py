@@ -11,7 +11,16 @@ from telegram import Update
 from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-from downloader import DownloadError, download_media, is_instagram, is_twitter, is_facebook, is_tiktok, is_threads
+from downloader import (
+    DownloadError,
+    download_media,
+    instagram_status,
+    is_instagram,
+    is_twitter,
+    is_facebook,
+    is_tiktok,
+    is_threads,
+)
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -22,6 +31,8 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 BASE_DIR = Path(__file__).parent
 CONFIG_PATH = BASE_DIR / "config.json"
@@ -68,6 +79,21 @@ def get_admin_id() -> Optional[int]:
 
 def is_admin(user_id: int) -> bool:
     return user_id == get_admin_id()
+
+
+def _format_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours and minutes:
+        return f"{hours}h {minutes}m"
+    if hours:
+        return f"{hours}h"
+    if minutes and secs:
+        return f"{minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m"
+    return f"{secs}s"
 
 
 def _load_instagram_alert_state() -> dict:
@@ -239,6 +265,34 @@ async def cmd_lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+async def cmd_instagram_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Solo el admin puede usar este comando.")
+        return
+
+    status = instagram_status()
+    alert_state = _load_instagram_alert_state()
+
+    lines = ["Estado Instagram:"]
+    if status["circuit_open"]:
+        lines.append(f"Cooldown: activo ({_format_duration(status['remaining_seconds'])})")
+    else:
+        lines.append("Cooldown: inactivo")
+    lines.append(f"Cooldown configurado: {status['cooldown_seconds']}s")
+    fixers = ", ".join(status["fixer_hosts"]) if status["fixer_hosts"] else "ninguno"
+    lines.append(f"Fixers: {fixers}")
+    lines.append(
+        f"Verificacion SSL fixers: {'on' if status['fixer_verify_ssl'] else 'off'}"
+    )
+    if alert_state.get("instagram_failure_alert_date"):
+        lines.append(f"Ultima alerta admin: {alert_state['instagram_failure_alert_date']}")
+    else:
+        lines.append("Ultima alerta admin: ninguna")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_allowed(user.id):
@@ -337,6 +391,7 @@ def main():
     app.add_handler(CommandHandler("agregar", cmd_agregar))
     app.add_handler(CommandHandler("borrar", cmd_borrar))
     app.add_handler(CommandHandler("lista", cmd_lista))
+    app.add_handler(CommandHandler("instagram_status", cmd_instagram_status))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     logger.info("Bot iniciado con polling.")
     app.run_polling(drop_pending_updates=True)
