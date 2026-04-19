@@ -1,10 +1,12 @@
+__pycache__/
+*.pyc
+
 telegrambot/config.json
 telegrambot/allowed_users.txt
+telegrambot/bot.log
+telegrambot/instagram_alert_state.json
 telegrambot/cookies.txt
 telegrambot/threads_cookies.txt
 telegrambot/facebook_cookies.txt
-telegrambot/bot.log
 bot/config.php
 combined_bot.log
-__pycache__/
-*.pyc

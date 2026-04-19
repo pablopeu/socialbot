@@ -18,7 +18,6 @@ El bot corre directamente en una VM de Oracle Cloud (free forever). No necesita 
 
 - Cuenta en [Oracle Cloud](https://cloud.oracle.com) (free tier, requiere tarjeta para verificación)
 - Bot de Telegram creado con [@BotFather](https://t.me/BotFather)
-- Cookies de Instagram exportadas del navegador (para posts de Instagram)
 
 ---
 
@@ -112,11 +111,7 @@ nano allowed_users.txt
 
 Para saber tu ID de Telegram escribile a [@userinfobot](https://t.me/userinfobot).
 
-**Cookies de Instagram** — exportar con la extensión Cookie-Editor del navegador (formato Netscape) y copiar a la VM:
-```bash
-# Desde tu PC (PowerShell):
-scp -i "Oracle ssh-key.key" cookies.txt ubuntu@10.241.x.x:/home/ubuntu/socialbot/telegrambot/cookies.txt
-```
+**Instagram** — el bot intenta bajar posts públicos en modo anónimo. No usa una cuenta de Instagram ni necesita `cookies.txt` para Instagram.
 
 ---
 
@@ -173,10 +168,20 @@ sudo systemctl restart socialbot
 cd ~/socialbot && git pull && sudo systemctl restart socialbot
 ```
 
+Comandos Telegram para el admin:
+- `/lista`
+- `/agregar ID [nombre]`
+- `/borrar ID`
+- `/instagram_status`
+
 ---
 
 ## Notas
 
-- Las cookies de Instagram expiran. Si deja de funcionar con Instagram, repetir el paso 5.
+- Instagram puede rate-limitar la IP de Oracle incluso sin usar una cuenta. Si falla, esperá y reintentá más tarde.
+- El bot activa un cooldown automático de 15 minutos después de un bloqueo de Instagram para no seguir golpeando la misma IP. Se puede cambiar con `SOCIALBOT_INSTAGRAM_COOLDOWN_SECONDS`.
+- Cuando el acceso directo a Instagram falla, el bot prueba una cadena de fixers externos. Se puede cambiar con `SOCIALBOT_INSTAGRAM_FIXER_HOSTS`.
+- Si Instagram falla incluso después de probar todos los fixers, el bot avisa al admin configurado una sola vez por día.
+- El bot baja el ruido de logs HTTP de librerías externas; para diagnosticar Instagram usá `/instagram_status` y los logs propios del servicio.
 - Oracle Cloud Always Free no tiene límite de tiempo ni costo mientras se use el shape gratuito.
 - Telegram tiene un límite de 50 MB por archivo. Videos más grandes no se pueden enviar.

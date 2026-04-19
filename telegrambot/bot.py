@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -10,7 +11,16 @@ from telegram import Update
 from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-from downloader import download_media, is_instagram, is_twitter, is_facebook, is_tiktok, is_threads
+from downloader import (
+    DownloadError,
+    download_media,
+    instagram_status,
+    is_instagram,
+    is_twitter,
+    is_facebook,
+    is_tiktok,
+    is_threads,
+)
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -21,10 +31,14 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 BASE_DIR = Path(__file__).parent
 CONFIG_PATH = BASE_DIR / "config.json"
 ALLOWED_USERS_PATH = BASE_DIR / "allowed_users.txt"
+INSTAGRAM_ALERT_STATE_PATH = BASE_DIR / "instagram_alert_state.json"
+INSTAGRAM_ALERT_LOCK = asyncio.Lock()
 
 
 def load_token() -> str:
@@ -65,6 +79,85 @@ def get_admin_id() -> Optional[int]:
 
 def is_admin(user_id: int) -> bool:
     return user_id == get_admin_id()
+
+
+def _format_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours and minutes:
+        return f"{hours}h {minutes}m"
+    if hours:
+        return f"{hours}h"
+    if minutes and secs:
+        return f"{minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m"
+    return f"{secs}s"
+
+
+def _load_instagram_alert_state() -> dict:
+    if not INSTAGRAM_ALERT_STATE_PATH.exists():
+        return {}
+    try:
+        return json.loads(INSTAGRAM_ALERT_STATE_PATH.read_text())
+    except Exception as e:
+        logger.warning(f"Failed to read Instagram alert state: {e}")
+        return {}
+
+
+def _save_instagram_alert_state(state: dict):
+    try:
+        INSTAGRAM_ALERT_STATE_PATH.write_text(
+            json.dumps(state, ensure_ascii=True, indent=2) + "\n"
+        )
+    except Exception as e:
+        logger.warning(f"Failed to write Instagram alert state: {e}")
+
+
+def _should_notify_instagram_admin(error_text: str) -> bool:
+    text = (error_text or "").lower()
+    return "inválido" not in text
+
+
+async def _maybe_notify_instagram_admin(
+    context: ContextTypes.DEFAULT_TYPE,
+    requested_by: int,
+    url: str,
+    error_text: str,
+):
+    admin_id = get_admin_id()
+    if not admin_id or not _should_notify_instagram_admin(error_text):
+        return
+
+    today = datetime.now().date().isoformat()
+    async with INSTAGRAM_ALERT_LOCK:
+        state = _load_instagram_alert_state()
+        if state.get("instagram_failure_alert_date") == today:
+            return
+
+        message = (
+            "Alerta Instagram: fallaron todas las rutas del bot para un link.\n"
+            f"Fecha: {today}\n"
+            f"Solicitado por: {requested_by}\n"
+            f"URL: {url}\n"
+            f"Error: {error_text}"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=message,
+                disable_web_page_preview=True,
+            )
+        except TelegramError as e:
+            logger.error(f"Failed to send Instagram admin alert: {e}")
+            return
+
+        state["instagram_failure_alert_date"] = today
+        state["instagram_failure_alert_url"] = url
+        state["instagram_failure_alert_error"] = error_text
+        state["instagram_failure_alert_requested_by"] = requested_by
+        _save_instagram_alert_state(state)
 
 
 # --- Handlers ---
@@ -172,6 +265,34 @@ async def cmd_lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+async def cmd_instagram_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Solo el admin puede usar este comando.")
+        return
+
+    status = instagram_status()
+    alert_state = _load_instagram_alert_state()
+
+    lines = ["Estado Instagram:"]
+    if status["circuit_open"]:
+        lines.append(f"Cooldown: activo ({_format_duration(status['remaining_seconds'])})")
+    else:
+        lines.append("Cooldown: inactivo")
+    lines.append(f"Cooldown configurado: {status['cooldown_seconds']}s")
+    fixers = ", ".join(status["fixer_hosts"]) if status["fixer_hosts"] else "ninguno"
+    lines.append(f"Fixers: {fixers}")
+    lines.append(
+        f"Verificacion SSL fixers: {'on' if status['fixer_verify_ssl'] else 'off'}"
+    )
+    if alert_state.get("instagram_failure_alert_date"):
+        lines.append(f"Ultima alerta admin: {alert_state['instagram_failure_alert_date']}")
+    else:
+        lines.append("Ultima alerta admin: ninguna")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_allowed(user.id):
@@ -201,6 +322,12 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         items = await asyncio.to_thread(download_media, text)
+    except DownloadError as e:
+        logger.error(f"Download error for {text}: {e}")
+        if is_instagram(text):
+            await _maybe_notify_instagram_admin(context, user.id, text, str(e))
+        await status.edit_text(str(e))
+        return
     except Exception as e:
         logger.error(f"Error in download_media: {e}")
         await status.edit_text("Error inesperado al descargar el contenido.")
@@ -264,6 +391,7 @@ def main():
     app.add_handler(CommandHandler("agregar", cmd_agregar))
     app.add_handler(CommandHandler("borrar", cmd_borrar))
     app.add_handler(CommandHandler("lista", cmd_lista))
+    app.add_handler(CommandHandler("instagram_status", cmd_instagram_status))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     logger.info("Bot iniciado con polling.")
     app.run_polling(drop_pending_updates=True)
