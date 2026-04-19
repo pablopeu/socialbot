@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from typing import Optional
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +195,24 @@ def _extract_og_media_items(html: str) -> list:
     return items
 
 
+def _ig_fixer_download_headers(host: str) -> dict:
+    return {
+        "User-Agent": BROWSER_HEADERS["User-Agent"],
+        "Accept": "*/*",
+        "Referer": f"https://{host}/",
+    }
+
+
+def _normalize_fixer_media_url(cdn_url: str) -> str:
+    parts = urlsplit(cdn_url)
+    if parts.netloc.endswith("vxinstagram.com") and parts.path == "/VerifySnapsaveLink":
+        query = parse_qs(parts.query)
+        rapid_urls = query.get("rapidsaveUrl")
+        if rapid_urls and rapid_urls[0]:
+            return rapid_urls[0]
+    return cdn_url
+
+
 def _ig_download_via_fixers(url: str) -> list:
     path = _ig_path_from_url(url)
     if not path or not INSTAGRAM_FIXER_HOSTS:
@@ -228,9 +246,11 @@ def _ig_download_via_fixers(url: str) -> list:
 
         results = []
         for item in items:
+            media_url = _normalize_fixer_media_url(item["cdn_url"])
             downloaded, status_code = _download_cdn_url(
-                item["cdn_url"],
+                media_url,
                 item["type"],
+                headers=_ig_fixer_download_headers(host),
                 return_status=True,
             )
             if downloaded:
@@ -243,6 +263,19 @@ def _ig_download_via_fixers(url: str) -> list:
                 )
                 results = []
                 break
+            elif status_code:
+                logger.info(
+                    "Instagram fixer %s media download returned HTTP %s for %s",
+                    host,
+                    status_code,
+                    item["type"],
+                )
+            else:
+                logger.info(
+                    "Instagram fixer %s media download failed without HTTP status for %s",
+                    host,
+                    item["type"],
+                )
 
         if results:
             logger.info(f"Instagram media downloaded via fixer {host}")
