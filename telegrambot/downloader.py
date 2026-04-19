@@ -17,6 +17,8 @@ import instaloader
 import yt_dlp
 
 COOKIES_PATH = os.path.join(os.path.dirname(__file__), "cookies.txt")
+IG_SESSION_PATH = os.path.join(os.path.dirname(__file__), "instagram.session")
+IG_SESSION_USER_PATH = os.path.join(os.path.dirname(__file__), "instagram_session_user.txt")
 THREADS_COOKIES_PATH = os.path.join(os.path.dirname(__file__), "threads_cookies.txt")
 FACEBOOK_COOKIES_PATH = os.path.join(os.path.dirname(__file__), "facebook_cookies.txt")
 
@@ -120,11 +122,56 @@ def _load_cookies_into_session(session, cookie_path: str):
     session.cookies.update(jar)
 
 
-def _ig_cdn_items(url: str) -> Optional[list]:
-    """Use instaloader to get CDN URLs for an Instagram post."""
+def _ig_session_username() -> Optional[str]:
+    if not os.path.exists(IG_SESSION_USER_PATH):
+        return None
+    try:
+        username = open(IG_SESSION_USER_PATH).read().strip()
+    except OSError:
+        return None
+    return username or None
+
+
+def _ig_has_auth() -> bool:
+    return (
+        (os.path.exists(IG_SESSION_PATH) and bool(_ig_session_username()))
+        or os.path.exists(COOKIES_PATH)
+    )
+
+
+def _ig_apply_auth(loader: instaloader.Instaloader) -> Optional[str]:
+    username = _ig_session_username()
+    if username and os.path.exists(IG_SESSION_PATH):
+        try:
+            loader.load_session_from_file(username, IG_SESSION_PATH)
+            logger.info(f"Instagram session loaded for {username}")
+            return "session"
+        except Exception as e:
+            logger.warning(f"Failed to load Instagram session file: {e}")
+
+    if os.path.exists(COOKIES_PATH):
+        try:
+            _load_cookies_into_session(loader.context._session, COOKIES_PATH)
+            logger.info("Instagram cookies.txt loaded into Instaloader session")
+            return "cookies"
+        except Exception as e:
+            logger.warning(f"Failed to load Instagram cookies.txt: {e}")
+
+    return None
+
+
+def _ig_download(url: str) -> list:
+    """Use Instaloader running on the VM to resolve Instagram media URLs."""
     shortcode = _ig_shortcode_from_url(url)
     if not shortcode:
-        return None
+        raise DownloadError("Link de Instagram inválido.")
+
+    if not _ig_has_auth():
+        raise DownloadError(
+            "Instagram no está configurado en la VM. Ejecutá por SSH "
+            "`python3 /home/ubuntu/socialbot/telegrambot/instagram_session.py --username TU_USUARIO` "
+            "y reintentá."
+        )
 
     L = instaloader.Instaloader(
         download_pictures=False,
@@ -134,15 +181,29 @@ def _ig_cdn_items(url: str) -> Optional[list]:
         download_comments=False,
         save_metadata=False,
         quiet=True,
+        max_connection_attempts=1,
     )
 
-    if os.path.exists(COOKIES_PATH):
-        _load_cookies_into_session(L.context._session, COOKIES_PATH)
+    auth_mode = _ig_apply_auth(L)
+    if not auth_mode:
+        raise DownloadError(
+            "Instagram no pudo cargar una sesión válida en la VM. "
+            "Renová la sesión con `instagram_session.py`."
+        )
 
     try:
         post = instaloader.Post.from_shortcode(L.context, shortcode)
-    except Exception:
-        return None
+    except Exception as e:
+        message = str(e)
+        if _is_instagram_auth_or_rate_limit_error(message):
+            raise DownloadError(
+                "La sesión de Instagram de la VM fue bloqueada o venció. "
+                "Esperá unos minutos y renovala con `instagram_session.py`."
+            ) from e
+        raise DownloadError(
+            "Instagram rechazó la extracción desde la sesión de la VM. "
+            "Renová la sesión e intentá de nuevo."
+        ) from e
 
     items = []
     if post.typename == "GraphSidecar":
@@ -156,18 +217,37 @@ def _ig_cdn_items(url: str) -> Optional[list]:
     else:
         items.append({"type": "image", "cdn_url": post.url})
 
-    return items if items else None
+    if not items:
+        raise DownloadError("Instagram no devolvió medios para ese post.")
+
+    results = []
+    for item in items:
+        downloaded = _download_cdn_url(
+            item["cdn_url"],
+            item["type"],
+            cookies=L.context._session.cookies,
+        )
+        if downloaded:
+            results.append(downloaded)
+    if results:
+        return results
+
+    raise DownloadError(
+        "Instagram resolvió el post pero no pude bajar los archivos desde la CDN."
+    )
 
 
-def _download_cdn_url(cdn_url: str, item_type: str, headers: dict = None) -> Optional[dict]:
+def _download_cdn_url(cdn_url: str, item_type: str, headers: dict = None, cookies=None) -> Optional[dict]:
     """Download a CDN URL to a temp file and return {type, path, mime}."""
     suffix = ".mp4" if item_type == "video" else ".jpg"
     fd, tmp_path = tempfile.mkstemp(suffix=suffix, prefix="ig_cdn_")
     os.close(fd)
     if headers is None:
         headers = BROWSER_HEADERS
+    if cookies is not None and hasattr(cookies, "get_dict"):
+        cookies = cookies.get_dict()
     try:
-        with httpx.Client(follow_redirects=True, timeout=120) as client:
+        with httpx.Client(follow_redirects=True, timeout=120, cookies=cookies) as client:
             with client.stream("GET", cdn_url, headers=headers) as r:
                 if r.status_code != 200:
                     os.unlink(tmp_path)
@@ -278,6 +358,10 @@ def download_media(url: str) -> list:
     Caller is responsible for deleting the temp files.
     """
     url = _normalize_url(url)
+
+    if is_instagram(url):
+        return _ig_download(url)
+
     tmp_dir = f"/tmp/bot_{uuid.uuid4().hex}"
     os.makedirs(tmp_dir, exist_ok=True)
 
@@ -388,17 +472,5 @@ def download_media(url: str) -> list:
                     results.append(downloaded)
             return results
         return []
-
-    # Instaloader fallback for Instagram. Skip it when Instagram already asked
-    # for login/rate-limit, otherwise we only burn more requests on the same IP.
-    if is_instagram(url):
-        cdn_items = _ig_cdn_items(url)
-        if cdn_items:
-            results = []
-            for item in cdn_items:
-                downloaded = _download_cdn_url(item["cdn_url"], item["type"])
-                if downloaded:
-                    results.append(downloaded)
-            return results
 
     return []

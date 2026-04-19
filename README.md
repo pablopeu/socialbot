@@ -18,7 +18,7 @@ El bot corre directamente en una VM de Oracle Cloud (free forever). No necesita 
 
 - Cuenta en [Oracle Cloud](https://cloud.oracle.com) (free tier, requiere tarjeta para verificación)
 - Bot de Telegram creado con [@BotFather](https://t.me/BotFather)
-- Cookies de Instagram exportadas del navegador (para posts de Instagram)
+- Una sesión de Instagram creada en la misma VM (recomendado) o cookies en formato Netscape
 
 ---
 
@@ -112,11 +112,24 @@ nano allowed_users.txt
 
 Para saber tu ID de Telegram escribile a [@userinfobot](https://t.me/userinfobot).
 
-**Cookies de Instagram** — exportar con la extensión Cookie-Editor del navegador (formato Netscape) y copiar a la VM:
+**Instagram en la VM** — crear una sesión persistente directamente en Oracle:
 ```bash
-# Desde tu PC (PowerShell):
-scp -i "Oracle ssh-key.key" cookies.txt ubuntu@10.241.x.x:/home/ubuntu/socialbot/telegrambot/cookies.txt
+cd ~/socialbot/telegrambot
+python3 instagram_session.py --username TU_USUARIO
 ```
+
+El script guarda:
+- `instagram.session`
+- `instagram_session_user.txt`
+
+La sesión se crea y se usa desde la misma VM, que es más estable que exportar cookies desde otra máquina. Si necesitás renovar la sesión:
+```bash
+cd ~/socialbot/telegrambot
+python3 instagram_session.py --check
+python3 instagram_session.py --username TU_USUARIO
+```
+
+**Alternativa**: si ya usás `cookies.txt`, el bot la sigue aceptando como fallback.
 
 ---
 
@@ -178,5 +191,6 @@ cd ~/socialbot && git pull && sudo systemctl restart socialbot
 ## Notas
 
 - Las cookies de Instagram expiran. Si deja de funcionar con Instagram, repetir el paso 5.
+- La sesión `instagram.session` suele durar más que `cookies.txt`, pero Instagram puede invalidarla o rate-limitar la IP de la VM. Si falla, ejecutá de nuevo `python3 instagram_session.py --username TU_USUARIO`.
 - Oracle Cloud Always Free no tiene límite de tiempo ni costo mientras se use el shape gratuito.
 - Telegram tiene un límite de 50 MB por archivo. Videos más grandes no se pueden enviar.
