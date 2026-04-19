@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import uuid
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,10 @@ MIME_MAP = {
 MAX_TG_BYTES = 50 * 1024 * 1024  # 50 MB Telegram bot limit
 
 
+class DownloadError(Exception):
+    """User-facing download error."""
+
+
 def is_instagram(url: str) -> bool:
     return "instagram.com" in url or "instagr.am" in url
 
@@ -78,6 +83,35 @@ def _is_direct(f: dict) -> bool:
 def _ig_shortcode_from_url(url: str) -> Optional[str]:
     m = re.search(r"instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)", url)
     return m.group(1) if m else None
+
+
+def _normalize_url(url: str) -> str:
+    """Strip tracking query params from supported post URLs."""
+    url = url.strip()
+    try:
+        parts = urlsplit(url)
+    except Exception:
+        return url
+
+    host = (parts.netloc or "").lower()
+    path = parts.path or ""
+    if ("instagram.com" in host or "instagr.am" in host) and re.search(r"/(?:p|reel|tv)/[A-Za-z0-9_-]+/?$", path):
+        return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+    return url
+
+
+def _is_instagram_auth_or_rate_limit_error(message: str) -> bool:
+    text = (message or "").lower()
+    needles = (
+        "requested content is not available",
+        "rate-limit reached",
+        "login required",
+        "please wait a few minutes",
+        "instagram sent an empty media response",
+        "401 unauthorized",
+        "403 forbidden",
+    )
+    return any(needle in text for needle in needles)
 
 
 def _load_cookies_into_session(session, cookie_path: str):
@@ -243,6 +277,7 @@ def download_media(url: str) -> list:
     Returns list of: {'type': 'video'|'image', 'path': str, 'mime': str}
     Caller is responsible for deleting the temp files.
     """
+    url = _normalize_url(url)
     tmp_dir = f"/tmp/bot_{uuid.uuid4().hex}"
     os.makedirs(tmp_dir, exist_ok=True)
 
@@ -255,12 +290,17 @@ def download_media(url: str) -> list:
     }
 
     # Pick the right cookies file for the platform
+    cookiefile = None
     if is_threads(url) and os.path.exists(THREADS_COOKIES_PATH):
-        ydl_opts["cookiefile"] = THREADS_COOKIES_PATH
+        cookiefile = THREADS_COOKIES_PATH
     elif is_facebook(url) and os.path.exists(FACEBOOK_COOKIES_PATH):
-        ydl_opts["cookiefile"] = FACEBOOK_COOKIES_PATH
+        cookiefile = FACEBOOK_COOKIES_PATH
     elif os.path.exists(COOKIES_PATH):
-        ydl_opts["cookiefile"] = COOKIES_PATH
+        cookiefile = COOKIES_PATH
+    if cookiefile:
+        ydl_opts["cookiefile"] = cookiefile
+    elif is_instagram(url):
+        logger.warning("Instagram request without cookies.txt configured")
 
     ytdlp_ok = False
     try:
@@ -273,6 +313,17 @@ def download_media(url: str) -> list:
         ytdlp_ok = bool(files)
     except Exception as e:
         logger.error(f"yt-dlp error for {url}: {e}")
+        if is_instagram(url) and _is_instagram_auth_or_rate_limit_error(str(e)):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            if cookiefile:
+                raise DownloadError(
+                    "Instagram bloqueó temporalmente la sesión o las cookies vencieron. "
+                    "Esperá unos minutos, renová `cookies.txt` y reintentá."
+                ) from e
+            raise DownloadError(
+                "Instagram pidió login y el bot no tiene `cookies.txt` cargado. "
+                "Exportá cookies nuevas desde el navegador y reintentá."
+            ) from e
 
     if ytdlp_ok:
         results = []
@@ -338,7 +389,8 @@ def download_media(url: str) -> list:
             return results
         return []
 
-    # Instaloader fallback for Instagram
+    # Instaloader fallback for Instagram. Skip it when Instagram already asked
+    # for login/rate-limit, otherwise we only burn more requests on the same IP.
     if is_instagram(url):
         cdn_items = _ig_cdn_items(url)
         if cdn_items:

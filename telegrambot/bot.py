@@ -10,7 +10,7 @@ from telegram import Update
 from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-from downloader import download_media, is_instagram, is_twitter, is_facebook, is_tiktok, is_threads
+from downloader import DownloadError, download_media, is_instagram, is_twitter, is_facebook, is_tiktok, is_threads
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -201,6 +201,10 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         items = await asyncio.to_thread(download_media, text)
+    except DownloadError as e:
+        logger.error(f"Download error for {text}: {e}")
+        await status.edit_text(str(e))
+        return
     except Exception as e:
         logger.error(f"Error in download_media: {e}")
         await status.edit_text("Error inesperado al descargar el contenido.")
