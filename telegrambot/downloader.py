@@ -5,6 +5,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import uuid
 from typing import Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -45,10 +47,53 @@ MIME_MAP = {
 }
 
 MAX_TG_BYTES = 50 * 1024 * 1024  # 50 MB Telegram bot limit
+INSTAGRAM_COOLDOWN_SECONDS = max(
+    0, int(os.getenv("SOCIALBOT_INSTAGRAM_COOLDOWN_SECONDS", "900"))
+)
+_INSTAGRAM_CIRCUIT_UNTIL = 0.0
+_INSTAGRAM_CIRCUIT_LOCK = threading.Lock()
 
 
 class DownloadError(Exception):
     """User-facing download error."""
+
+
+def _format_seconds(seconds: float) -> str:
+    total = max(1, int(seconds))
+    minutes, secs = divmod(total, 60)
+    if minutes and secs:
+        return f"{minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m"
+    return f"{secs}s"
+
+
+def _instagram_circuit_remaining() -> float:
+    with _INSTAGRAM_CIRCUIT_LOCK:
+        remaining = _INSTAGRAM_CIRCUIT_UNTIL - time.monotonic()
+    return max(0.0, remaining)
+
+
+def _trip_instagram_circuit(reason: str):
+    if INSTAGRAM_COOLDOWN_SECONDS <= 0:
+        return
+    until = time.monotonic() + INSTAGRAM_COOLDOWN_SECONDS
+    with _INSTAGRAM_CIRCUIT_LOCK:
+        global _INSTAGRAM_CIRCUIT_UNTIL
+        _INSTAGRAM_CIRCUIT_UNTIL = max(_INSTAGRAM_CIRCUIT_UNTIL, until)
+    logger.warning(
+        "Instagram circuit breaker armed for %s (%s)",
+        _format_seconds(INSTAGRAM_COOLDOWN_SECONDS),
+        reason,
+    )
+
+
+def _instagram_circuit_message() -> str:
+    remaining = _instagram_circuit_remaining()
+    return (
+        "Instagram está en cooldown desde esta VM por un bloqueo previo. "
+        f"Reintentá en {_format_seconds(remaining)}."
+    )
 
 
 def is_instagram(url: str) -> bool:
@@ -115,6 +160,9 @@ def _is_instagram_auth_or_rate_limit_error(message: str) -> bool:
 
 def _ig_download(url: str) -> list:
     """Use anonymous Instaloader access for public Instagram posts."""
+    if _instagram_circuit_remaining() > 0:
+        raise DownloadError(_instagram_circuit_message())
+
     shortcode = _ig_shortcode_from_url(url)
     if not shortcode:
         raise DownloadError("Link de Instagram inválido.")
@@ -135,9 +183,10 @@ def _ig_download(url: str) -> list:
     except Exception as e:
         message = str(e)
         if _is_instagram_auth_or_rate_limit_error(message):
+            _trip_instagram_circuit(message)
             raise DownloadError(
                 "Instagram bloqueó el acceso público desde esta VM. "
-                "El bot no usa ninguna cuenta de Instagram. Probá más tarde."
+                f"El bot no usa ninguna cuenta de Instagram. {_instagram_circuit_message()}"
             ) from e
         raise DownloadError(
             "No pude extraer ese post de Instagram en modo anónimo."
@@ -160,9 +209,19 @@ def _ig_download(url: str) -> list:
 
     results = []
     for item in items:
-        downloaded = _download_cdn_url(item["cdn_url"], item["type"])
+        downloaded, status_code = _download_cdn_url(
+            item["cdn_url"],
+            item["type"],
+            return_status=True,
+        )
         if downloaded:
             results.append(downloaded)
+        elif status_code in (401, 403, 429):
+            _trip_instagram_circuit(f"cdn http {status_code}")
+            raise DownloadError(
+                "Instagram bloqueó la descarga pública desde esta VM. "
+                f"{_instagram_circuit_message()}"
+            )
     if results:
         return results
 
@@ -171,7 +230,7 @@ def _ig_download(url: str) -> list:
     )
 
 
-def _download_cdn_url(cdn_url: str, item_type: str, headers: dict = None) -> Optional[dict]:
+def _download_cdn_url(cdn_url: str, item_type: str, headers: dict = None, return_status: bool = False):
     """Download a CDN URL to a temp file and return {type, path, mime}."""
     suffix = ".mp4" if item_type == "video" else ".jpg"
     fd, tmp_path = tempfile.mkstemp(suffix=suffix, prefix="ig_cdn_")
@@ -183,18 +242,19 @@ def _download_cdn_url(cdn_url: str, item_type: str, headers: dict = None) -> Opt
             with client.stream("GET", cdn_url, headers=headers) as r:
                 if r.status_code != 200:
                     os.unlink(tmp_path)
-                    return None
+                    return (None, r.status_code) if return_status else None
                 with open(tmp_path, "wb") as f:
                     for chunk in r.iter_bytes(65536):
                         f.write(chunk)
         mime = "video/mp4" if item_type == "video" else "image/jpeg"
-        return {"type": item_type, "path": tmp_path, "mime": mime}
+        item = {"type": item_type, "path": tmp_path, "mime": mime}
+        return (item, 200) if return_status else item
     except Exception:
         try:
             os.unlink(tmp_path)
         except FileNotFoundError:
             pass
-        return None
+        return (None, None) if return_status else None
 
 
 def _facebook_scrape(url: str) -> Optional[list]:

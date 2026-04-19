@@ -173,5 +173,6 @@ cd ~/socialbot && git pull && sudo systemctl restart socialbot
 ## Notas
 
 - Instagram puede rate-limitar la IP de Oracle incluso sin usar una cuenta. Si falla, esperá y reintentá más tarde.
+- El bot activa un cooldown automático de 15 minutos después de un bloqueo de Instagram para no seguir golpeando la misma IP. Se puede cambiar con `SOCIALBOT_INSTAGRAM_COOLDOWN_SECONDS`.
 - Oracle Cloud Always Free no tiene límite de tiempo ni costo mientras se use el shape gratuito.
 - Telegram tiene un límite de 50 MB por archivo. Videos más grandes no se pueden enviar.
