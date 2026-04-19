@@ -1,5 +1,4 @@
 import html as html_lib
-import http.cookiejar
 import logging
 import os
 import re
@@ -17,8 +16,6 @@ import instaloader
 import yt_dlp
 
 COOKIES_PATH = os.path.join(os.path.dirname(__file__), "cookies.txt")
-IG_SESSION_PATH = os.path.join(os.path.dirname(__file__), "instagram.session")
-IG_SESSION_USER_PATH = os.path.join(os.path.dirname(__file__), "instagram_session_user.txt")
 THREADS_COOKIES_PATH = os.path.join(os.path.dirname(__file__), "threads_cookies.txt")
 FACEBOOK_COOKIES_PATH = os.path.join(os.path.dirname(__file__), "facebook_cookies.txt")
 
@@ -116,62 +113,11 @@ def _is_instagram_auth_or_rate_limit_error(message: str) -> bool:
     return any(needle in text for needle in needles)
 
 
-def _load_cookies_into_session(session, cookie_path: str):
-    jar = http.cookiejar.MozillaCookieJar()
-    jar.load(cookie_path, ignore_discard=True, ignore_expires=True)
-    session.cookies.update(jar)
-
-
-def _ig_session_username() -> Optional[str]:
-    if not os.path.exists(IG_SESSION_USER_PATH):
-        return None
-    try:
-        username = open(IG_SESSION_USER_PATH).read().strip()
-    except OSError:
-        return None
-    return username or None
-
-
-def _ig_has_auth() -> bool:
-    return (
-        (os.path.exists(IG_SESSION_PATH) and bool(_ig_session_username()))
-        or os.path.exists(COOKIES_PATH)
-    )
-
-
-def _ig_apply_auth(loader: instaloader.Instaloader) -> Optional[str]:
-    username = _ig_session_username()
-    if username and os.path.exists(IG_SESSION_PATH):
-        try:
-            loader.load_session_from_file(username, IG_SESSION_PATH)
-            logger.info(f"Instagram session loaded for {username}")
-            return "session"
-        except Exception as e:
-            logger.warning(f"Failed to load Instagram session file: {e}")
-
-    if os.path.exists(COOKIES_PATH):
-        try:
-            _load_cookies_into_session(loader.context._session, COOKIES_PATH)
-            logger.info("Instagram cookies.txt loaded into Instaloader session")
-            return "cookies"
-        except Exception as e:
-            logger.warning(f"Failed to load Instagram cookies.txt: {e}")
-
-    return None
-
-
 def _ig_download(url: str) -> list:
-    """Use Instaloader running on the VM to resolve Instagram media URLs."""
+    """Use anonymous Instaloader access for public Instagram posts."""
     shortcode = _ig_shortcode_from_url(url)
     if not shortcode:
         raise DownloadError("Link de Instagram inválido.")
-
-    if not _ig_has_auth():
-        raise DownloadError(
-            "Instagram no está configurado en la VM. Ejecutá por SSH "
-            "`python3 /home/ubuntu/socialbot/telegrambot/instagram_session.py --username TU_USUARIO` "
-            "y reintentá."
-        )
 
     L = instaloader.Instaloader(
         download_pictures=False,
@@ -184,25 +130,17 @@ def _ig_download(url: str) -> list:
         max_connection_attempts=1,
     )
 
-    auth_mode = _ig_apply_auth(L)
-    if not auth_mode:
-        raise DownloadError(
-            "Instagram no pudo cargar una sesión válida en la VM. "
-            "Renová la sesión con `instagram_session.py`."
-        )
-
     try:
         post = instaloader.Post.from_shortcode(L.context, shortcode)
     except Exception as e:
         message = str(e)
         if _is_instagram_auth_or_rate_limit_error(message):
             raise DownloadError(
-                "La sesión de Instagram de la VM fue bloqueada o venció. "
-                "Esperá unos minutos y renovala con `instagram_session.py`."
+                "Instagram bloqueó el acceso público desde esta VM. "
+                "El bot no usa ninguna cuenta de Instagram. Probá más tarde."
             ) from e
         raise DownloadError(
-            "Instagram rechazó la extracción desde la sesión de la VM. "
-            "Renová la sesión e intentá de nuevo."
+            "No pude extraer ese post de Instagram en modo anónimo."
         ) from e
 
     items = []
@@ -222,32 +160,26 @@ def _ig_download(url: str) -> list:
 
     results = []
     for item in items:
-        downloaded = _download_cdn_url(
-            item["cdn_url"],
-            item["type"],
-            cookies=L.context._session.cookies,
-        )
+        downloaded = _download_cdn_url(item["cdn_url"], item["type"])
         if downloaded:
             results.append(downloaded)
     if results:
         return results
 
     raise DownloadError(
-        "Instagram resolvió el post pero no pude bajar los archivos desde la CDN."
+        "Instagram resolvió el post, pero no pude bajar los archivos desde la CDN."
     )
 
 
-def _download_cdn_url(cdn_url: str, item_type: str, headers: dict = None, cookies=None) -> Optional[dict]:
+def _download_cdn_url(cdn_url: str, item_type: str, headers: dict = None) -> Optional[dict]:
     """Download a CDN URL to a temp file and return {type, path, mime}."""
     suffix = ".mp4" if item_type == "video" else ".jpg"
     fd, tmp_path = tempfile.mkstemp(suffix=suffix, prefix="ig_cdn_")
     os.close(fd)
     if headers is None:
         headers = BROWSER_HEADERS
-    if cookies is not None and hasattr(cookies, "get_dict"):
-        cookies = cookies.get_dict()
     try:
-        with httpx.Client(follow_redirects=True, timeout=120, cookies=cookies) as client:
+        with httpx.Client(follow_redirects=True, timeout=120) as client:
             with client.stream("GET", cdn_url, headers=headers) as r:
                 if r.status_code != 200:
                     os.unlink(tmp_path)

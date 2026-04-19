@@ -7,7 +7,5 @@ telegrambot/bot.log
 telegrambot/cookies.txt
 telegrambot/threads_cookies.txt
 telegrambot/facebook_cookies.txt
-telegrambot/instagram.session
-telegrambot/instagram_session_user.txt
 bot/config.php
 combined_bot.log
