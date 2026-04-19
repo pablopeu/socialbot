@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +26,8 @@ logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).parent
 CONFIG_PATH = BASE_DIR / "config.json"
 ALLOWED_USERS_PATH = BASE_DIR / "allowed_users.txt"
+INSTAGRAM_ALERT_STATE_PATH = BASE_DIR / "instagram_alert_state.json"
+INSTAGRAM_ALERT_LOCK = asyncio.Lock()
 
 
 def load_token() -> str:
@@ -65,6 +68,70 @@ def get_admin_id() -> Optional[int]:
 
 def is_admin(user_id: int) -> bool:
     return user_id == get_admin_id()
+
+
+def _load_instagram_alert_state() -> dict:
+    if not INSTAGRAM_ALERT_STATE_PATH.exists():
+        return {}
+    try:
+        return json.loads(INSTAGRAM_ALERT_STATE_PATH.read_text())
+    except Exception as e:
+        logger.warning(f"Failed to read Instagram alert state: {e}")
+        return {}
+
+
+def _save_instagram_alert_state(state: dict):
+    try:
+        INSTAGRAM_ALERT_STATE_PATH.write_text(
+            json.dumps(state, ensure_ascii=True, indent=2) + "\n"
+        )
+    except Exception as e:
+        logger.warning(f"Failed to write Instagram alert state: {e}")
+
+
+def _should_notify_instagram_admin(error_text: str) -> bool:
+    text = (error_text or "").lower()
+    return "inválido" not in text
+
+
+async def _maybe_notify_instagram_admin(
+    context: ContextTypes.DEFAULT_TYPE,
+    requested_by: int,
+    url: str,
+    error_text: str,
+):
+    admin_id = get_admin_id()
+    if not admin_id or not _should_notify_instagram_admin(error_text):
+        return
+
+    today = datetime.now().date().isoformat()
+    async with INSTAGRAM_ALERT_LOCK:
+        state = _load_instagram_alert_state()
+        if state.get("instagram_failure_alert_date") == today:
+            return
+
+        message = (
+            "Alerta Instagram: fallaron todas las rutas del bot para un link.\n"
+            f"Fecha: {today}\n"
+            f"Solicitado por: {requested_by}\n"
+            f"URL: {url}\n"
+            f"Error: {error_text}"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=message,
+                disable_web_page_preview=True,
+            )
+        except TelegramError as e:
+            logger.error(f"Failed to send Instagram admin alert: {e}")
+            return
+
+        state["instagram_failure_alert_date"] = today
+        state["instagram_failure_alert_url"] = url
+        state["instagram_failure_alert_error"] = error_text
+        state["instagram_failure_alert_requested_by"] = requested_by
+        _save_instagram_alert_state(state)
 
 
 # --- Handlers ---
@@ -203,6 +270,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         items = await asyncio.to_thread(download_media, text)
     except DownloadError as e:
         logger.error(f"Download error for {text}: {e}")
+        if is_instagram(text):
+            await _maybe_notify_instagram_admin(context, user.id, text, str(e))
         await status.edit_text(str(e))
         return
     except Exception as e:

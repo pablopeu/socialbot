@@ -4,6 +4,7 @@ __pycache__/
 telegrambot/config.json
 telegrambot/allowed_users.txt
 telegrambot/bot.log
+telegrambot/instagram_alert_state.json
 telegrambot/cookies.txt
 telegrambot/threads_cookies.txt
 telegrambot/facebook_cookies.txt
