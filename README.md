@@ -136,11 +136,12 @@ Mandar un link al bot en Telegram:
 ```
 https://www.instagram.com/p/SHORTCODE/
 https://www.instagram.com/reel/SHORTCODE/
+https://www.instagram.com/stories/usuario/1234567890/
 https://x.com/usuario/status/1234567890
 https://twitter.com/usuario/status/1234567890
 ```
 
-El bot responde con las fotos y/o videos del post. Soporta posts individuales, carousels y reels.
+El bot responde con las fotos y/o videos del post. Soporta posts individuales, carousels y reels. Para Stories intenta el método alternativo de Instagram; si la historia venció, es privada o el fixer no la expone públicamente, no se puede descargar sin sesión.
 
 Los usuarios no autorizados reciben: *"No tenés acceso. Contactate con el admin."*
 

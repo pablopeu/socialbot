@@ -151,11 +151,26 @@ def _ig_shortcode_from_url(url: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def _ig_story_path_from_url(url: str) -> Optional[str]:
+    parts = urlsplit(url)
+    host = (parts.netloc or "").lower()
+    if "instagram.com" not in host and "instagr.am" not in host:
+        return None
+
+    path = parts.path or ""
+    if re.search(r"/stories/[^/]+/[0-9]+/?$", path):
+        return path if path.endswith("/") else f"{path}/"
+    return None
+
+
 def _ig_path_from_url(url: str) -> Optional[str]:
     parts = urlsplit(url)
     path = parts.path or ""
     if re.search(r"/(?:p|reel|reels|tv)/[A-Za-z0-9_-]+/?$", path):
         return path if path.endswith("/") else f"{path}/"
+    story_path = _ig_story_path_from_url(url)
+    if story_path:
+        return story_path
     return None
 
 
@@ -169,7 +184,9 @@ def _normalize_url(url: str) -> str:
 
     host = (parts.netloc or "").lower()
     path = parts.path or ""
-    if ("instagram.com" in host or "instagr.am" in host) and re.search(r"/(?:p|reel|tv)/[A-Za-z0-9_-]+/?$", path):
+    if ("instagram.com" in host or "instagr.am" in host) and re.search(
+        r"/(?:p|reel|tv|stories/[^/]+)/[A-Za-z0-9_-]+/?$", path
+    ):
         return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
     return url
 
@@ -365,6 +382,15 @@ def _ig_download_direct(url: str) -> list:
 
 
 def _ig_download(url: str) -> list:
+    if _ig_story_path_from_url(url):
+        fixer_results = _ig_download_via_fixers(url)
+        if fixer_results:
+            return fixer_results
+        raise DownloadError(
+            "No pude obtener esa historia de Instagram con el método alternativo. "
+            "Puede haber vencido, ser privada o no estar disponible públicamente."
+        )
+
     if _instagram_circuit_remaining() > 0:
         fixer_results = _ig_download_via_fixers(url)
         if fixer_results:

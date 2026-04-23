@@ -117,7 +117,8 @@ def _save_instagram_alert_state(state: dict):
 
 def _should_notify_instagram_admin(error_text: str) -> bool:
     text = (error_text or "").lower()
-    return "inválido" not in text
+    ignored_errors = ("inválido", "historia de instagram")
+    return not any(error in text for error in ignored_errors)
 
 
 async def _maybe_notify_instagram_admin(
