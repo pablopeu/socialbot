@@ -1,4 +1,5 @@
 import html as html_lib
+import json
 import logging
 import os
 import re
@@ -9,7 +10,7 @@ import threading
 import time
 import uuid
 from typing import Optional
-from urllib.parse import parse_qs, urlsplit, urlunsplit
+from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,12 @@ YDL_HTTP_HEADERS = {
     "Sec-Fetch-Mode": "navigate",
 }
 
+SAVEINSTA_HEADERS = {
+    "User-Agent": YDL_HTTP_HEADERS["User-Agent"],
+    "Accept": "*/*",
+    "Referer": "https://saveinsta.io/",
+}
+
 MIME_MAP = {
     "mp4": "video/mp4", "webm": "video/webm", "mov": "video/quicktime",
     "jpg": "image/jpeg", "jpeg": "image/jpeg",
@@ -61,6 +68,10 @@ INSTAGRAM_FIXER_HOSTS = tuple(
 INSTAGRAM_FIXER_VERIFY_SSL = os.getenv(
     "SOCIALBOT_INSTAGRAM_FIXER_VERIFY_SSL", "0"
 ).lower() not in {"0", "false", "no", "off"}
+INSTAGRAM_SAVEINSTA_PAGE_URL = os.getenv(
+    "SOCIALBOT_INSTAGRAM_SAVEINSTA_PAGE_URL",
+    "https://saveinsta.io/en/story-downloader",
+)
 _INSTAGRAM_CIRCUIT_UNTIL = 0.0
 _INSTAGRAM_CIRCUIT_LOCK = threading.Lock()
 
@@ -241,6 +252,145 @@ def _normalize_fixer_media_url(cdn_url: str) -> str:
     return cdn_url
 
 
+def _decode_saveinsta_script(script: str) -> str:
+    """
+    Decode Saveinsta's generated script without executing third-party JS.
+    The site returns an eval-wrapped base conversion payload containing HTML.
+    """
+    match = re.search(
+        r'\}\("(?P<payload>.*)",\d+,"(?P<alphabet>[^"]+)",'
+        r"(?P<offset>\d+),(?P<base>\d+),\d+\)\)$",
+        script,
+        re.S,
+    )
+    if not match:
+        return ""
+
+    payload = match.group("payload")
+    alphabet = match.group("alphabet")
+    offset = int(match.group("offset"))
+    source_base = int(match.group("base"))
+    separator = alphabet[source_base]
+
+    chars = []
+    for chunk in payload.split(separator):
+        if not chunk:
+            continue
+        for index, char in enumerate(alphabet):
+            chunk = chunk.replace(char, str(index))
+        try:
+            chars.append(chr(int(chunk, source_base) - offset))
+        except ValueError:
+            return ""
+
+    return unquote("".join(chars))
+
+
+def _extract_saveinsta_html(decoded_script: str) -> str:
+    assignment = 'document.getElementById("search-result").innerHTML = "'
+    start = decoded_script.find(assignment)
+    if start < 0:
+        return ""
+    start += len(assignment)
+    end = decoded_script.rfind('";')
+    if end <= start:
+        return ""
+
+    try:
+        return json.loads(f'"{decoded_script[start:end]}"')
+    except json.JSONDecodeError:
+        return ""
+
+
+def _extract_saveinsta_media_items(html: str) -> list:
+    items = []
+    seen = set()
+    for item_type, url in re.findall(
+        r'<a[^>]+title="Download (Image|Video)"[^>]+href="([^"]+)"',
+        html,
+        re.I,
+    ):
+        media_url = html_lib.unescape(url)
+        if media_url in seen:
+            continue
+        seen.add(media_url)
+        items.append(
+            {
+                "type": "video" if item_type.lower() == "video" else "image",
+                "cdn_url": media_url,
+            }
+        )
+    return items
+
+
+def _ig_download_story_via_saveinsta(url: str) -> list:
+    if not INSTAGRAM_SAVEINSTA_PAGE_URL:
+        return []
+
+    try:
+        with httpx.Client(follow_redirects=True, timeout=45) as client:
+            page = client.get(INSTAGRAM_SAVEINSTA_PAGE_URL, headers=YDL_HTTP_HEADERS)
+            page.raise_for_status()
+
+            exp_match = re.search(r'k_exp="([^"]+)"', page.text)
+            token_match = re.search(r'k_token="([^"]+)"', page.text)
+            if not exp_match or not token_match:
+                logger.debug("Saveinsta page did not expose token metadata")
+                return []
+
+            response = client.post(
+                "https://saveinsta.io/api/ajaxSearch",
+                data={
+                    "k_exp": exp_match.group(1),
+                    "k_token": token_match.group(1),
+                    "q": url,
+                    "t": "media",
+                    "lang": "en",
+                    "v": "v2",
+                    "html": "",
+                },
+                headers={
+                    **YDL_HTTP_HEADERS,
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Origin": "https://saveinsta.io",
+                    "Referer": INSTAGRAM_SAVEINSTA_PAGE_URL,
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except Exception as e:
+        logger.debug("Saveinsta story request failed: %s", e)
+        return []
+
+    script = payload.get("data")
+    if payload.get("status") != "ok" or not isinstance(script, str) or not script:
+        logger.debug("Saveinsta returned no usable story payload")
+        return []
+
+    decoded = _decode_saveinsta_script(script)
+    html = _extract_saveinsta_html(decoded)
+    cdn_items = _extract_saveinsta_media_items(html)
+    if not cdn_items:
+        logger.debug("Saveinsta returned no downloadable story links")
+        return []
+
+    results = []
+    for item in cdn_items:
+        downloaded = _download_cdn_url(
+            item["cdn_url"],
+            item["type"],
+            headers=SAVEINSTA_HEADERS,
+        )
+        if downloaded:
+            results.append(downloaded)
+
+    if results:
+        logger.info("Instagram story media downloaded via Saveinsta")
+    return results
+
+
 def _ig_download_via_fixers(url: str) -> list:
     path = _ig_path_from_url(url)
     if not path or not INSTAGRAM_FIXER_HOSTS:
@@ -386,8 +536,11 @@ def _ig_download(url: str) -> list:
         fixer_results = _ig_download_via_fixers(url)
         if fixer_results:
             return fixer_results
+        saveinsta_results = _ig_download_story_via_saveinsta(url)
+        if saveinsta_results:
+            return saveinsta_results
         raise DownloadError(
-            "No pude obtener esa historia de Instagram con el método alternativo. "
+            "No pude obtener esa historia de Instagram con los métodos alternativos. "
             "Puede haber vencido, ser privada o no estar disponible públicamente."
         )
 
