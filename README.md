@@ -179,9 +179,8 @@ Comandos Telegram para el admin:
 
 ## Notas
 
-- Instagram puede rate-limitar la IP de Oracle incluso sin usar una cuenta. Si falla, esperá y reintentá más tarde.
-- El bot activa un cooldown automático de 15 minutos después de un bloqueo de Instagram para no seguir golpeando la misma IP. Se puede cambiar con `SOCIALBOT_INSTAGRAM_COOLDOWN_SECONDS`.
-- Cuando el acceso directo a Instagram falla, el bot prueba una cadena de fixers externos. Se puede cambiar con `SOCIALBOT_INSTAGRAM_FIXER_HOSTS`. Para Stories también prueba Saveinsta; se puede cambiar con `SOCIALBOT_INSTAGRAM_SAVEINSTA_PAGE_URL`.
+- Instagram puede rate-limitar la IP de Oracle incluso sin usar una cuenta.
+- Cuando el acceso directo a Instagram falla, el bot prueba una cadena de fixers externos. Para posts intenta reconstruir carousels consultando indices de imagen y deduplicando resultados; se puede cambiar el limite con `SOCIALBOT_INSTAGRAM_MAX_CAROUSEL_ITEMS`. Los fixers se pueden cambiar con `SOCIALBOT_INSTAGRAM_FIXER_HOSTS`. Para Stories también prueba Saveinsta; se puede cambiar con `SOCIALBOT_INSTAGRAM_SAVEINSTA_PAGE_URL`.
 - Si Instagram falla incluso después de probar todos los fixers, el bot avisa al admin configurado una sola vez por día.
 - El bot baja el ruido de logs HTTP de librerías externas; para diagnosticar Instagram usá `/instagram_status` y los logs propios del servicio.
 - Oracle Cloud Always Free no tiene límite de tiempo ni costo mientras se use el shape gratuito.

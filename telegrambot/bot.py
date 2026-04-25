@@ -81,21 +81,6 @@ def is_admin(user_id: int) -> bool:
     return user_id == get_admin_id()
 
 
-def _format_duration(seconds: int) -> str:
-    seconds = max(0, int(seconds))
-    minutes, secs = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours and minutes:
-        return f"{hours}h {minutes}m"
-    if hours:
-        return f"{hours}h"
-    if minutes and secs:
-        return f"{minutes}m {secs}s"
-    if minutes:
-        return f"{minutes}m"
-    return f"{secs}s"
-
-
 def _load_instagram_alert_state() -> dict:
     if not INSTAGRAM_ALERT_STATE_PATH.exists():
         return {}
@@ -276,13 +261,9 @@ async def cmd_instagram_status(update: Update, context: ContextTypes.DEFAULT_TYP
     alert_state = _load_instagram_alert_state()
 
     lines = ["Estado Instagram:"]
-    if status["circuit_open"]:
-        lines.append(f"Cooldown: activo ({_format_duration(status['remaining_seconds'])})")
-    else:
-        lines.append("Cooldown: inactivo")
-    lines.append(f"Cooldown configurado: {status['cooldown_seconds']}s")
     fixers = ", ".join(status["fixer_hosts"]) if status["fixer_hosts"] else "ninguno"
     lines.append(f"Fixers: {fixers}")
+    lines.append(f"Max carousel fixer: {status['max_carousel_items']}")
     lines.append(
         f"Verificacion SSL fixers: {'on' if status['fixer_verify_ssl'] else 'off'}"
     )
