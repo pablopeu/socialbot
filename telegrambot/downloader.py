@@ -180,9 +180,19 @@ def _ig_img_index_from_url(url: str) -> Optional[int]:
     return index if index > 0 else None
 
 
-def _select_ig_indexed_items(items: list, url: str) -> list:
+def _ig_img_index_query_from_url(url: str) -> str:
+    img_index = _ig_img_index_from_url(url)
+    return f"img_index={img_index}" if img_index else ""
+
+
+def _select_ig_indexed_items(
+    items: list, url: str, allow_single_item_fallback: bool = False
+) -> list:
     img_index = _ig_img_index_from_url(url)
     if img_index is None:
+        return items
+
+    if allow_single_item_fallback and len(items) == 1:
         return items
 
     item_index = img_index - 1
@@ -229,12 +239,9 @@ def _normalize_url(url: str) -> str:
     if ("instagram.com" in host or "instagr.am" in host) and re.search(
         r"/(?:p|reel|tv|stories/[^/]+)/[A-Za-z0-9_-]+/?$", path
     ):
-        query = parse_qs(parts.query)
-        img_index = query.get("img_index", [None])[0]
-        clean_query = ""
-        if img_index and img_index.isdigit() and int(img_index) > 0:
-            clean_query = f"img_index={img_index}"
-        return urlunsplit((parts.scheme, parts.netloc, path, clean_query, ""))
+        return urlunsplit(
+            (parts.scheme, parts.netloc, path, _ig_img_index_query_from_url(url), "")
+        )
     return url
 
 
@@ -434,7 +441,9 @@ def _ig_download_via_fixers(url: str) -> list:
     prefer_video = bool(re.search(r"/(?:reel|reels|tv)/", path))
 
     for host in INSTAGRAM_FIXER_HOSTS:
-        fixer_url = urlunsplit(("https", host, path, "", ""))
+        fixer_url = urlunsplit(
+            ("https", host, path, _ig_img_index_query_from_url(url), "")
+        )
         try:
             with httpx.Client(
                 follow_redirects=True,
@@ -459,7 +468,9 @@ def _ig_download_via_fixers(url: str) -> list:
             continue
 
         try:
-            items = _select_ig_indexed_items(items, url)
+            items = _select_ig_indexed_items(
+                items, url, allow_single_item_fallback=True
+            )
         except DownloadError as e:
             logger.debug(f"Instagram fixer {host} could not satisfy img_index: {e}")
             continue
