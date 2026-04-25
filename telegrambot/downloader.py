@@ -162,47 +162,6 @@ def _ig_shortcode_from_url(url: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def _ig_img_index_from_url(url: str) -> Optional[int]:
-    try:
-        query = parse_qs(urlsplit(url).query)
-    except Exception:
-        return None
-
-    values = query.get("img_index")
-    if not values:
-        return None
-
-    try:
-        index = int(values[0])
-    except (TypeError, ValueError):
-        return None
-
-    return index if index > 0 else None
-
-
-def _ig_img_index_query_from_url(url: str) -> str:
-    img_index = _ig_img_index_from_url(url)
-    return f"img_index={img_index}" if img_index else ""
-
-
-def _select_ig_indexed_items(
-    items: list, url: str, allow_single_item_fallback: bool = False
-) -> list:
-    img_index = _ig_img_index_from_url(url)
-    if img_index is None:
-        return items
-
-    if allow_single_item_fallback and len(items) == 1:
-        return items
-
-    item_index = img_index - 1
-    if item_index >= len(items):
-        raise DownloadError(
-            f"Ese post de Instagram no tiene una imagen en la posición {img_index}."
-        )
-    return [items[item_index]]
-
-
 def _ig_story_path_from_url(url: str) -> Optional[str]:
     parts = urlsplit(url)
     host = (parts.netloc or "").lower()
@@ -239,9 +198,7 @@ def _normalize_url(url: str) -> str:
     if ("instagram.com" in host or "instagr.am" in host) and re.search(
         r"/(?:p|reel|tv|stories/[^/]+)/[A-Za-z0-9_-]+/?$", path
     ):
-        return urlunsplit(
-            (parts.scheme, parts.netloc, path, _ig_img_index_query_from_url(url), "")
-        )
+        return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
     return url
 
 
@@ -441,9 +398,7 @@ def _ig_download_via_fixers(url: str) -> list:
     prefer_video = bool(re.search(r"/(?:reel|reels|tv)/", path))
 
     for host in INSTAGRAM_FIXER_HOSTS:
-        fixer_url = urlunsplit(
-            ("https", host, path, _ig_img_index_query_from_url(url), "")
-        )
+        fixer_url = urlunsplit(("https", host, path, "", ""))
         try:
             with httpx.Client(
                 follow_redirects=True,
@@ -465,14 +420,6 @@ def _ig_download_via_fixers(url: str) -> list:
             continue
         if prefer_video and not any(item["type"] == "video" for item in items):
             logger.debug(f"Instagram fixer {host} returned only images for reel/tv")
-            continue
-
-        try:
-            items = _select_ig_indexed_items(
-                items, url, allow_single_item_fallback=True
-            )
-        except DownloadError as e:
-            logger.debug(f"Instagram fixer {host} could not satisfy img_index: {e}")
             continue
 
         results = []
@@ -560,8 +507,6 @@ def _ig_download_direct(url: str) -> list:
 
     if not items:
         raise DownloadError("Instagram no devolvió medios para ese post.")
-
-    items = _select_ig_indexed_items(items, url)
 
     results = []
     for item in items:
