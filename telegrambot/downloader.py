@@ -1,4 +1,5 @@
 import html as html_lib
+import hashlib
 import json
 import logging
 import os
@@ -250,6 +251,42 @@ def _append_unique_media_items(items: list, new_items: list, seen: set) -> int:
     return added
 
 
+def _file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _emit_downloaded_item(
+    item: dict,
+    results: list,
+    on_item=None,
+    seen_hashes: set = None,
+) -> bool:
+    if seen_hashes is not None:
+        try:
+            item_hash = _file_sha256(item["path"])
+        except Exception as e:
+            logger.debug("Could not hash downloaded Instagram item: %s", e)
+            item_hash = None
+
+        if item_hash and item_hash in seen_hashes:
+            try:
+                os.unlink(item["path"])
+            except FileNotFoundError:
+                pass
+            return False
+        if item_hash:
+            seen_hashes.add(item_hash)
+
+    results.append(item)
+    if on_item:
+        on_item(item)
+    return True
+
+
 def _decode_saveinsta_script(script: str) -> str:
     """
     Decode Saveinsta's generated script without executing third-party JS.
@@ -321,7 +358,7 @@ def _extract_saveinsta_media_items(html: str) -> list:
     return items
 
 
-def _ig_download_story_via_saveinsta(url: str) -> list:
+def _ig_download_story_via_saveinsta(url: str, on_item=None) -> list:
     if not INSTAGRAM_SAVEINSTA_PAGE_URL:
         return []
 
@@ -382,7 +419,7 @@ def _ig_download_story_via_saveinsta(url: str) -> list:
             headers=SAVEINSTA_HEADERS,
         )
         if downloaded:
-            results.append(downloaded)
+            _emit_downloaded_item(downloaded, results, on_item)
 
     if results:
         logger.info("Instagram story media downloaded via Saveinsta")
@@ -404,7 +441,7 @@ def _ig_collect_fixer_items(client: httpx.Client, host: str, url: str) -> list:
     return _extract_og_media_items(r.text)
 
 
-def _ig_download_via_fixers(url: str, source_url: str = None) -> list:
+def _ig_download_via_fixers(url: str, source_url: str = None, on_item=None) -> list:
     path = _ig_path_from_url(url)
     if not path or not INSTAGRAM_FIXER_HOSTS:
         return []
@@ -419,6 +456,7 @@ def _ig_download_via_fixers(url: str, source_url: str = None) -> list:
         results = []
         items = []
         seen = set()
+        seen_hashes = set()
         duplicate_or_empty_seen = False
         try:
             with httpx.Client(
@@ -472,7 +510,12 @@ def _ig_download_via_fixers(url: str, source_url: str = None) -> list:
                 return_status=True,
             )
             if downloaded:
-                results.append(downloaded)
+                _emit_downloaded_item(
+                    downloaded,
+                    results,
+                    on_item,
+                    seen_hashes=seen_hashes if should_probe_carousel else None,
+                )
             elif status_code in (401, 403, 429):
                 logger.debug(
                     "Instagram fixer %s exposed media URL but CDN returned HTTP %s",
@@ -496,13 +539,26 @@ def _ig_download_via_fixers(url: str, source_url: str = None) -> list:
                 )
 
         if results:
+            if requested_img_index and len(results) < requested_img_index:
+                logger.debug(
+                    "Instagram fixer %s only downloaded %s/%s unique carousel items",
+                    host,
+                    len(results),
+                    requested_img_index,
+                )
+                for item in results:
+                    try:
+                        os.unlink(item["path"])
+                    except FileNotFoundError:
+                        pass
+                continue
             logger.info(f"Instagram media downloaded via fixer {host}")
             return results
 
     return []
 
 
-def _ig_download_direct(url: str) -> list:
+def _ig_download_direct(url: str, on_item=None) -> list:
     """Use anonymous Instaloader access for public Instagram posts."""
     shortcode = _ig_shortcode_from_url(url)
     if not shortcode:
@@ -549,6 +605,7 @@ def _ig_download_direct(url: str) -> list:
         raise DownloadError("Instagram no devolvió medios para ese post.")
 
     results = []
+    seen_hashes = set()
     for item in items:
         downloaded, status_code = _download_cdn_url(
             item["cdn_url"],
@@ -556,7 +613,12 @@ def _ig_download_direct(url: str) -> list:
             return_status=True,
         )
         if downloaded:
-            results.append(downloaded)
+            _emit_downloaded_item(
+                downloaded,
+                results,
+                on_item,
+                seen_hashes=seen_hashes if len(items) > 1 else None,
+            )
         elif status_code in (401, 403, 429):
             _trip_instagram_circuit(f"cdn http {status_code}")
             raise DownloadError(
@@ -570,13 +632,15 @@ def _ig_download_direct(url: str) -> list:
     )
 
 
-def _ig_download(url: str, source_url: str = None) -> list:
+def _ig_download(url: str, source_url: str = None, on_item=None) -> list:
     source_url = source_url or url
     if _ig_story_path_from_url(url):
-        fixer_results = _ig_download_via_fixers(url, source_url=source_url)
+        fixer_results = _ig_download_via_fixers(
+            url, source_url=source_url, on_item=on_item
+        )
         if fixer_results:
             return fixer_results
-        saveinsta_results = _ig_download_story_via_saveinsta(url)
+        saveinsta_results = _ig_download_story_via_saveinsta(url, on_item=on_item)
         if saveinsta_results:
             return saveinsta_results
         raise DownloadError(
@@ -585,9 +649,11 @@ def _ig_download(url: str, source_url: str = None) -> list:
         )
 
     try:
-        return _ig_download_direct(url)
+        return _ig_download_direct(url, on_item=on_item)
     except DownloadError as direct_error:
-        fixer_results = _ig_download_via_fixers(url, source_url=source_url)
+        fixer_results = _ig_download_via_fixers(
+            url, source_url=source_url, on_item=on_item
+        )
         if fixer_results:
             return fixer_results
         raise direct_error
@@ -706,7 +772,7 @@ def _threads_scrape(url: str) -> Optional[list]:
     return None
 
 
-def download_media(url: str) -> list:
+def download_media(url: str, on_item=None) -> list:
     """
     Download all media from a URL.
     Returns list of: {'type': 'video'|'image', 'path': str, 'mime': str}
@@ -716,7 +782,7 @@ def download_media(url: str) -> list:
     url = _normalize_url(source_url)
 
     if is_instagram(url):
-        return _ig_download(url, source_url=source_url)
+        return _ig_download(url, source_url=source_url, on_item=on_item)
 
     tmp_dir = f"/tmp/bot_{uuid.uuid4().hex}"
     os.makedirs(tmp_dir, exist_ok=True)

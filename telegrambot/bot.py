@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import queue
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +34,103 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+async def _send_downloaded_item(update: Update, item: dict, caption: str):
+    path = item["path"]
+    try:
+        with open(path, "rb") as f:
+            if item["type"] == "video":
+                await update.message.reply_video(
+                    f,
+                    caption=caption,
+                    supports_streaming=True,
+                    read_timeout=120,
+                    write_timeout=120,
+                )
+            else:
+                await update.message.reply_photo(f, caption=caption)
+    finally:
+        if not item.get("_dir"):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+
+async def _download_and_send_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, status):
+    user = update.effective_user
+    item_queue = queue.Queue()
+    done = object()
+    result = {"items": [], "error": None}
+
+    def on_item(item: dict):
+        item_queue.put(item)
+
+    def worker():
+        try:
+            result["items"] = download_media(text, on_item=on_item)
+        except Exception as e:
+            result["error"] = e
+        finally:
+            item_queue.put(done)
+
+    worker_task = asyncio.create_task(asyncio.to_thread(worker))
+    sent = 0
+    status_deleted = False
+
+    while True:
+        item = await asyncio.to_thread(item_queue.get)
+        if item is done:
+            break
+
+        sent += 1
+        if not status_deleted:
+            try:
+                await status.delete()
+            except TelegramError:
+                pass
+            status_deleted = True
+
+        caption = f"{sent} - {text}" if sent > 1 else text
+        try:
+            await _send_downloaded_item(update, item, caption)
+        except TelegramError as e:
+            logger.error(f"Telegram error sending Instagram item {sent}: {e}")
+            await update.message.reply_text(
+                f"No pude enviar el archivo {sent}: el archivo puede ser demasiado grande (límite 50 MB)."
+            )
+        except Exception as e:
+            logger.error(f"Error sending Instagram item {sent}: {e}")
+            await update.message.reply_text(f"Error al enviar el archivo {sent}.")
+
+    await worker_task
+
+    if result["error"]:
+        if isinstance(result["error"], DownloadError):
+            logger.error(f"Download error for {text}: {result['error']}")
+            await _maybe_notify_instagram_admin(context, user.id, text, str(result["error"]))
+            if sent:
+                await update.message.reply_text(str(result["error"]))
+            else:
+                await status.edit_text(str(result["error"]))
+            return
+
+        logger.error(f"Error in download_media: {result['error']}")
+        if sent:
+            await update.message.reply_text("Error inesperado al descargar el contenido.")
+        else:
+            await status.edit_text("Error inesperado al descargar el contenido.")
+        return
+
+    if not sent:
+        await status.edit_text(
+            "No pude obtener el contenido de Instagram.\n"
+            "El post puede ser privado o el link inválido."
+        )
+        return
+
+    logger.info(f"Sent {sent} Instagram item(s) to user {user.id}")
 
 BASE_DIR = Path(__file__).parent
 CONFIG_PATH = BASE_DIR / "config.json"
@@ -302,12 +400,14 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status = await update.message.reply_text(f"Procesando tu link de {platform}...")
 
+    if is_instagram(text):
+        await _download_and_send_instagram(update, context, text, status)
+        return
+
     try:
         items = await asyncio.to_thread(download_media, text)
     except DownloadError as e:
         logger.error(f"Download error for {text}: {e}")
-        if is_instagram(text):
-            await _maybe_notify_instagram_admin(context, user.id, text, str(e))
         await status.edit_text(str(e))
         return
     except Exception as e:
@@ -329,22 +429,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for i, item in enumerate(items, 1):
         caption = f"{i}/{total} — {text}" if total > 1 else text
-        path = item["path"]
         if item.get("_dir"):
             dirs_to_clean.add(item["_dir"])
 
         try:
-            with open(path, "rb") as f:
-                if item["type"] == "video":
-                    await update.message.reply_video(
-                        f,
-                        caption=caption,
-                        supports_streaming=True,
-                        read_timeout=120,
-                        write_timeout=120,
-                    )
-                else:
-                    await update.message.reply_photo(f, caption=caption)
+            await _send_downloaded_item(update, item, caption)
         except TelegramError as e:
             logger.error(f"Telegram error sending item {i}: {e}")
             await update.message.reply_text(
@@ -353,12 +442,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Error sending item {i}: {e}")
             await update.message.reply_text(f"Error al enviar el archivo {i}.")
-        finally:
-            if not item.get("_dir"):
-                try:
-                    os.unlink(path)
-                except FileNotFoundError:
-                    pass
 
     for d in dirs_to_clean:
         shutil.rmtree(d, ignore_errors=True)
