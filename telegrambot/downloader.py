@@ -68,6 +68,9 @@ INSTAGRAM_SAVEINSTA_PAGE_URL = os.getenv(
     "SOCIALBOT_INSTAGRAM_SAVEINSTA_PAGE_URL",
     "https://saveinsta.io/en/story-downloader",
 )
+INSTAGRAM_USE_COOKIES = os.getenv(
+    "SOCIALBOT_INSTAGRAM_USE_COOKIES", "0"
+).lower() in {"1", "true", "yes", "on"}
 INSTAGRAM_MAX_CAROUSEL_ITEMS = max(
     1, int(os.getenv("SOCIALBOT_INSTAGRAM_MAX_CAROUSEL_ITEMS", "20"))
 )
@@ -81,6 +84,7 @@ def instagram_status() -> dict:
     return {
         "fixer_hosts": list(INSTAGRAM_FIXER_HOSTS),
         "fixer_verify_ssl": INSTAGRAM_FIXER_VERIFY_SSL,
+        "use_cookies": INSTAGRAM_USE_COOKIES,
         "max_carousel_items": INSTAGRAM_MAX_CAROUSEL_ITEMS,
     }
 
@@ -807,7 +811,7 @@ def download_media(url: str, on_item=None) -> list:
         cookiefile = THREADS_COOKIES_PATH
     elif is_facebook(url) and os.path.exists(FACEBOOK_COOKIES_PATH):
         cookiefile = FACEBOOK_COOKIES_PATH
-    elif os.path.exists(COOKIES_PATH):
+    elif (not is_instagram(url) or INSTAGRAM_USE_COOKIES) and os.path.exists(COOKIES_PATH):
         cookiefile = COOKIES_PATH
     if cookiefile:
         ydl_opts["cookiefile"] = cookiefile
@@ -833,8 +837,8 @@ def download_media(url: str, on_item=None) -> list:
                     "Esperá unos minutos, renová `cookies.txt` y reintentá."
                 ) from e
             raise DownloadError(
-                "Instagram pidió login y el bot no tiene `cookies.txt` cargado. "
-                "Exportá cookies nuevas desde el navegador y reintentá."
+                "Instagram bloqueó el acceso anónimo desde esta VM. "
+                "El bot no usa ninguna cuenta de Instagram."
             ) from e
 
     if ytdlp_ok:
