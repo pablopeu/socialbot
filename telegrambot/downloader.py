@@ -1,15 +1,15 @@
 import html as html_lib
+import hashlib
+import json
 import logging
 import os
 import re
 import shutil
 import subprocess
 import tempfile
-import threading
-import time
 import uuid
 from typing import Optional
-from urllib.parse import parse_qs, urlsplit, urlunsplit
+from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,12 @@ YDL_HTTP_HEADERS = {
     "Sec-Fetch-Mode": "navigate",
 }
 
+SAVEINSTA_HEADERS = {
+    "User-Agent": YDL_HTTP_HEADERS["User-Agent"],
+    "Accept": "*/*",
+    "Referer": "https://saveinsta.io/",
+}
+
 MIME_MAP = {
     "mp4": "video/mp4", "webm": "video/webm", "mov": "video/quicktime",
     "jpg": "image/jpeg", "jpeg": "image/jpeg",
@@ -47,9 +53,6 @@ MIME_MAP = {
 }
 
 MAX_TG_BYTES = 50 * 1024 * 1024  # 50 MB Telegram bot limit
-INSTAGRAM_COOLDOWN_SECONDS = max(
-    0, int(os.getenv("SOCIALBOT_INSTAGRAM_COOLDOWN_SECONDS", "900"))
-)
 INSTAGRAM_FIXER_HOSTS = tuple(
     host.strip()
     for host in os.getenv(
@@ -61,8 +64,13 @@ INSTAGRAM_FIXER_HOSTS = tuple(
 INSTAGRAM_FIXER_VERIFY_SSL = os.getenv(
     "SOCIALBOT_INSTAGRAM_FIXER_VERIFY_SSL", "0"
 ).lower() not in {"0", "false", "no", "off"}
-_INSTAGRAM_CIRCUIT_UNTIL = 0.0
-_INSTAGRAM_CIRCUIT_LOCK = threading.Lock()
+INSTAGRAM_SAVEINSTA_PAGE_URL = os.getenv(
+    "SOCIALBOT_INSTAGRAM_SAVEINSTA_PAGE_URL",
+    "https://saveinsta.io/en/story-downloader",
+)
+INSTAGRAM_MAX_CAROUSEL_ITEMS = max(
+    1, int(os.getenv("SOCIALBOT_INSTAGRAM_MAX_CAROUSEL_ITEMS", "20"))
+)
 
 
 class DownloadError(Exception):
@@ -70,52 +78,15 @@ class DownloadError(Exception):
 
 
 def instagram_status() -> dict:
-    remaining = _instagram_circuit_remaining()
     return {
-        "cooldown_seconds": INSTAGRAM_COOLDOWN_SECONDS,
-        "circuit_open": remaining > 0,
-        "remaining_seconds": int(remaining),
         "fixer_hosts": list(INSTAGRAM_FIXER_HOSTS),
         "fixer_verify_ssl": INSTAGRAM_FIXER_VERIFY_SSL,
+        "max_carousel_items": INSTAGRAM_MAX_CAROUSEL_ITEMS,
     }
 
 
-def _format_seconds(seconds: float) -> str:
-    total = max(1, int(seconds))
-    minutes, secs = divmod(total, 60)
-    if minutes and secs:
-        return f"{minutes}m {secs}s"
-    if minutes:
-        return f"{minutes}m"
-    return f"{secs}s"
-
-
-def _instagram_circuit_remaining() -> float:
-    with _INSTAGRAM_CIRCUIT_LOCK:
-        remaining = _INSTAGRAM_CIRCUIT_UNTIL - time.monotonic()
-    return max(0.0, remaining)
-
-
 def _trip_instagram_circuit(reason: str):
-    if INSTAGRAM_COOLDOWN_SECONDS <= 0:
-        return
-    until = time.monotonic() + INSTAGRAM_COOLDOWN_SECONDS
-    with _INSTAGRAM_CIRCUIT_LOCK:
-        global _INSTAGRAM_CIRCUIT_UNTIL
-        _INSTAGRAM_CIRCUIT_UNTIL = max(_INSTAGRAM_CIRCUIT_UNTIL, until)
-    logger.warning(
-        "Instagram circuit breaker armed for %s (%s)",
-        _format_seconds(INSTAGRAM_COOLDOWN_SECONDS),
-        reason,
-    )
-
-
-def _instagram_circuit_message() -> str:
-    remaining = _instagram_circuit_remaining()
-    return (
-        "Instagram está en cooldown desde esta VM por un bloqueo previo. "
-        f"Reintentá en {_format_seconds(remaining)}."
-    )
+    logger.warning("Instagram public access failed (%s)", reason)
 
 
 def is_instagram(url: str) -> bool:
@@ -151,11 +122,44 @@ def _ig_shortcode_from_url(url: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def _ig_img_index_from_url(url: str) -> Optional[int]:
+    try:
+        query = parse_qs(urlsplit(url).query)
+    except Exception:
+        return None
+
+    values = query.get("img_index")
+    if not values:
+        return None
+
+    try:
+        index = int(values[0])
+    except (TypeError, ValueError):
+        return None
+
+    return index if index > 0 else None
+
+
+def _ig_story_path_from_url(url: str) -> Optional[str]:
+    parts = urlsplit(url)
+    host = (parts.netloc or "").lower()
+    if "instagram.com" not in host and "instagr.am" not in host:
+        return None
+
+    path = parts.path or ""
+    if re.search(r"/stories/[^/]+/[0-9]+/?$", path):
+        return path if path.endswith("/") else f"{path}/"
+    return None
+
+
 def _ig_path_from_url(url: str) -> Optional[str]:
     parts = urlsplit(url)
     path = parts.path or ""
     if re.search(r"/(?:p|reel|reels|tv)/[A-Za-z0-9_-]+/?$", path):
         return path if path.endswith("/") else f"{path}/"
+    story_path = _ig_story_path_from_url(url)
+    if story_path:
+        return story_path
     return None
 
 
@@ -169,9 +173,18 @@ def _normalize_url(url: str) -> str:
 
     host = (parts.netloc or "").lower()
     path = parts.path or ""
-    if ("instagram.com" in host or "instagr.am" in host) and re.search(r"/(?:p|reel|tv)/[A-Za-z0-9_-]+/?$", path):
+    if ("instagram.com" in host or "instagr.am" in host) and re.search(
+        r"/(?:p|reel|tv|stories/[^/]+)/[A-Za-z0-9_-]+/?$", path
+    ):
         return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
     return url
+
+
+def _ig_url_with_img_index(url: str, img_index: int) -> str:
+    parts = urlsplit(url)
+    return urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, f"img_index={img_index}", "")
+    )
 
 
 def _is_instagram_auth_or_rate_limit_error(message: str) -> bool:
@@ -224,48 +237,285 @@ def _normalize_fixer_media_url(cdn_url: str) -> str:
     return cdn_url
 
 
-def _ig_download_via_fixers(url: str) -> list:
+def _append_unique_media_items(items: list, new_items: list, seen: set) -> int:
+    added = 0
+    for item in new_items:
+        media_url = _normalize_fixer_media_url(item["cdn_url"])
+        if media_url in seen:
+            continue
+        seen.add(media_url)
+        copied = dict(item)
+        copied["cdn_url"] = media_url
+        items.append(copied)
+        added += 1
+    return added
+
+
+def _file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _emit_downloaded_item(
+    item: dict,
+    results: list,
+    on_item=None,
+    seen_hashes: set = None,
+) -> bool:
+    if seen_hashes is not None:
+        try:
+            item_hash = _file_sha256(item["path"])
+        except Exception as e:
+            logger.debug("Could not hash downloaded Instagram item: %s", e)
+            item_hash = None
+
+        if item_hash and item_hash in seen_hashes:
+            try:
+                os.unlink(item["path"])
+            except FileNotFoundError:
+                pass
+            return False
+        if item_hash:
+            seen_hashes.add(item_hash)
+
+    results.append(item)
+    if on_item:
+        on_item(item)
+    return True
+
+
+def _decode_saveinsta_script(script: str) -> str:
+    """
+    Decode Saveinsta's generated script without executing third-party JS.
+    The site returns an eval-wrapped base conversion payload containing HTML.
+    """
+    match = re.search(
+        r'\}\("(?P<payload>.*)",\d+,"(?P<alphabet>[^"]+)",'
+        r"(?P<offset>\d+),(?P<base>\d+),\d+\)\)$",
+        script,
+        re.S,
+    )
+    if not match:
+        return ""
+
+    payload = match.group("payload")
+    alphabet = match.group("alphabet")
+    offset = int(match.group("offset"))
+    source_base = int(match.group("base"))
+    separator = alphabet[source_base]
+
+    chars = []
+    for chunk in payload.split(separator):
+        if not chunk:
+            continue
+        for index, char in enumerate(alphabet):
+            chunk = chunk.replace(char, str(index))
+        try:
+            chars.append(chr(int(chunk, source_base) - offset))
+        except ValueError:
+            return ""
+
+    return unquote("".join(chars))
+
+
+def _extract_saveinsta_html(decoded_script: str) -> str:
+    assignment = 'document.getElementById("search-result").innerHTML = "'
+    start = decoded_script.find(assignment)
+    if start < 0:
+        return ""
+    start += len(assignment)
+    end = decoded_script.rfind('";')
+    if end <= start:
+        return ""
+
+    try:
+        return json.loads(f'"{decoded_script[start:end]}"')
+    except json.JSONDecodeError:
+        return ""
+
+
+def _extract_saveinsta_media_items(html: str) -> list:
+    items = []
+    seen = set()
+    for item_type, url in re.findall(
+        r'<a[^>]+title="Download (Image|Video)"[^>]+href="([^"]+)"',
+        html,
+        re.I,
+    ):
+        media_url = html_lib.unescape(url)
+        if media_url in seen:
+            continue
+        seen.add(media_url)
+        items.append(
+            {
+                "type": "video" if item_type.lower() == "video" else "image",
+                "cdn_url": media_url,
+            }
+        )
+    return items
+
+
+def _ig_download_story_via_saveinsta(url: str, on_item=None) -> list:
+    if not INSTAGRAM_SAVEINSTA_PAGE_URL:
+        return []
+
+    try:
+        with httpx.Client(follow_redirects=True, timeout=45) as client:
+            page = client.get(INSTAGRAM_SAVEINSTA_PAGE_URL, headers=YDL_HTTP_HEADERS)
+            page.raise_for_status()
+
+            exp_match = re.search(r'k_exp="([^"]+)"', page.text)
+            token_match = re.search(r'k_token="([^"]+)"', page.text)
+            if not exp_match or not token_match:
+                logger.debug("Saveinsta page did not expose token metadata")
+                return []
+
+            response = client.post(
+                "https://saveinsta.io/api/ajaxSearch",
+                data={
+                    "k_exp": exp_match.group(1),
+                    "k_token": token_match.group(1),
+                    "q": url,
+                    "t": "media",
+                    "lang": "en",
+                    "v": "v2",
+                    "html": "",
+                },
+                headers={
+                    **YDL_HTTP_HEADERS,
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Origin": "https://saveinsta.io",
+                    "Referer": INSTAGRAM_SAVEINSTA_PAGE_URL,
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except Exception as e:
+        logger.debug("Saveinsta story request failed: %s", e)
+        return []
+
+    script = payload.get("data")
+    if payload.get("status") != "ok" or not isinstance(script, str) or not script:
+        logger.debug("Saveinsta returned no usable story payload")
+        return []
+
+    decoded = _decode_saveinsta_script(script)
+    html = _extract_saveinsta_html(decoded)
+    cdn_items = _extract_saveinsta_media_items(html)
+    if not cdn_items:
+        logger.debug("Saveinsta returned no downloadable story links")
+        return []
+
+    results = []
+    for item in cdn_items:
+        downloaded = _download_cdn_url(
+            item["cdn_url"],
+            item["type"],
+            headers=SAVEINSTA_HEADERS,
+        )
+        if downloaded:
+            _emit_downloaded_item(downloaded, results, on_item)
+
+    if results:
+        logger.info("Instagram story media downloaded via Saveinsta")
+    return results
+
+
+def _ig_collect_fixer_items(client: httpx.Client, host: str, url: str) -> list:
     path = _ig_path_from_url(url)
     if not path or not INSTAGRAM_FIXER_HOSTS:
         return []
+
+    fixer_parts = urlsplit(url)
+    fixer_url = urlunsplit(("https", host, path, fixer_parts.query, ""))
+    r = client.get(fixer_url, headers=YDL_HTTP_HEADERS)
+    if r.status_code != 200:
+        logger.debug(f"Instagram fixer {host} returned HTTP {r.status_code}")
+        return []
+
+    return _extract_og_media_items(r.text)
+
+
+def _ig_download_via_fixers(url: str, source_url: str = None, on_item=None) -> list:
+    path = _ig_path_from_url(url)
+    if not path or not INSTAGRAM_FIXER_HOSTS:
+        return []
+
+    source_url = source_url or url
     prefer_video = bool(re.search(r"/(?:reel|reels|tv)/", path))
+    is_post = bool(re.search(r"/p/[A-Za-z0-9_-]+/?$", path))
+    requested_img_index = _ig_img_index_from_url(source_url)
+    should_probe_carousel = is_post and not prefer_video
 
     for host in INSTAGRAM_FIXER_HOSTS:
-        fixer_url = urlunsplit(("https", host, path, "", ""))
+        results = []
+        items = []
+        seen = set()
+        seen_hashes = set()
+        duplicate_or_empty_seen = False
         try:
             with httpx.Client(
                 follow_redirects=True,
                 timeout=30,
                 verify=INSTAGRAM_FIXER_VERIFY_SSL,
             ) as client:
-                r = client.get(fixer_url, headers=YDL_HTTP_HEADERS)
+                base_items = _ig_collect_fixer_items(client, host, url)
+                _append_unique_media_items(items, base_items, seen)
+
+                if should_probe_carousel:
+                    for index in range(1, INSTAGRAM_MAX_CAROUSEL_ITEMS + 1):
+                        indexed_url = _ig_url_with_img_index(url, index)
+                        indexed_items = _ig_collect_fixer_items(
+                            client, host, indexed_url
+                        )
+                        added = _append_unique_media_items(
+                            items, indexed_items, seen
+                        )
+                        if added == 0:
+                            duplicate_or_empty_seen = True
+                            if index > 1:
+                                break
         except Exception as e:
             logger.debug(f"Instagram fixer {host} request failed: {e}")
             continue
 
-        if r.status_code != 200:
-            logger.debug(f"Instagram fixer {host} returned HTTP {r.status_code}")
-            continue
-
-        items = _extract_og_media_items(r.text)
         if not items:
             logger.debug(f"Instagram fixer {host} returned no og media tags")
             continue
         if prefer_video and not any(item["type"] == "video" for item in items):
             logger.debug(f"Instagram fixer {host} returned only images for reel/tv")
             continue
+        if requested_img_index and len(items) < requested_img_index:
+            logger.debug(
+                "Instagram fixer %s only exposed %s/%s carousel items",
+                host,
+                len(items),
+                requested_img_index,
+            )
+            continue
+        if should_probe_carousel and len(items) == 1 and not duplicate_or_empty_seen:
+            logger.debug(f"Instagram fixer {host} did not finish carousel probing")
+            continue
 
-        results = []
         for item in items:
-            media_url = _normalize_fixer_media_url(item["cdn_url"])
             downloaded, status_code = _download_cdn_url(
-                media_url,
+                item["cdn_url"],
                 item["type"],
                 headers=_ig_fixer_download_headers(host),
                 return_status=True,
             )
             if downloaded:
-                results.append(downloaded)
+                _emit_downloaded_item(
+                    downloaded,
+                    results,
+                    on_item,
+                    seen_hashes=seen_hashes if should_probe_carousel else None,
+                )
             elif status_code in (401, 403, 429):
                 logger.debug(
                     "Instagram fixer %s exposed media URL but CDN returned HTTP %s",
@@ -289,13 +539,26 @@ def _ig_download_via_fixers(url: str) -> list:
                 )
 
         if results:
+            if requested_img_index and len(results) < requested_img_index:
+                logger.debug(
+                    "Instagram fixer %s only downloaded %s/%s unique carousel items",
+                    host,
+                    len(results),
+                    requested_img_index,
+                )
+                for item in results:
+                    try:
+                        os.unlink(item["path"])
+                    except FileNotFoundError:
+                        pass
+                continue
             logger.info(f"Instagram media downloaded via fixer {host}")
             return results
 
     return []
 
 
-def _ig_download_direct(url: str) -> list:
+def _ig_download_direct(url: str, on_item=None) -> list:
     """Use anonymous Instaloader access for public Instagram posts."""
     shortcode = _ig_shortcode_from_url(url)
     if not shortcode:
@@ -320,7 +583,7 @@ def _ig_download_direct(url: str) -> list:
             _trip_instagram_circuit(message)
             raise DownloadError(
                 "Instagram bloqueó el acceso público desde esta VM. "
-                f"El bot no usa ninguna cuenta de Instagram. {_instagram_circuit_message()}"
+                "El bot no usa ninguna cuenta de Instagram."
             ) from e
         raise DownloadError(
             "No pude extraer ese post de Instagram en modo anónimo."
@@ -342,6 +605,7 @@ def _ig_download_direct(url: str) -> list:
         raise DownloadError("Instagram no devolvió medios para ese post.")
 
     results = []
+    seen_hashes = set()
     for item in items:
         downloaded, status_code = _download_cdn_url(
             item["cdn_url"],
@@ -349,12 +613,16 @@ def _ig_download_direct(url: str) -> list:
             return_status=True,
         )
         if downloaded:
-            results.append(downloaded)
+            _emit_downloaded_item(
+                downloaded,
+                results,
+                on_item,
+                seen_hashes=seen_hashes if len(items) > 1 else None,
+            )
         elif status_code in (401, 403, 429):
             _trip_instagram_circuit(f"cdn http {status_code}")
             raise DownloadError(
-                "Instagram bloqueó la descarga pública desde esta VM. "
-                f"{_instagram_circuit_message()}"
+                "Instagram bloqueó la descarga pública desde esta VM."
             )
     if results:
         return results
@@ -364,17 +632,28 @@ def _ig_download_direct(url: str) -> list:
     )
 
 
-def _ig_download(url: str) -> list:
-    if _instagram_circuit_remaining() > 0:
-        fixer_results = _ig_download_via_fixers(url)
+def _ig_download(url: str, source_url: str = None, on_item=None) -> list:
+    source_url = source_url or url
+    if _ig_story_path_from_url(url):
+        fixer_results = _ig_download_via_fixers(
+            url, source_url=source_url, on_item=on_item
+        )
         if fixer_results:
             return fixer_results
-        raise DownloadError(_instagram_circuit_message())
+        saveinsta_results = _ig_download_story_via_saveinsta(url, on_item=on_item)
+        if saveinsta_results:
+            return saveinsta_results
+        raise DownloadError(
+            "No pude obtener esa historia de Instagram con los métodos alternativos. "
+            "Puede haber vencido, ser privada o no estar disponible públicamente."
+        )
 
     try:
-        return _ig_download_direct(url)
+        return _ig_download_direct(url, on_item=on_item)
     except DownloadError as direct_error:
-        fixer_results = _ig_download_via_fixers(url)
+        fixer_results = _ig_download_via_fixers(
+            url, source_url=source_url, on_item=on_item
+        )
         if fixer_results:
             return fixer_results
         raise direct_error
@@ -493,16 +772,22 @@ def _threads_scrape(url: str) -> Optional[list]:
     return None
 
 
-def download_media(url: str) -> list:
+def download_media(url: str, on_item=None) -> list:
     """
     Download all media from a URL.
     Returns list of: {'type': 'video'|'image', 'path': str, 'mime': str}
     Caller is responsible for deleting the temp files.
     """
-    url = _normalize_url(url)
+    source_url = url.strip()
+    url = _normalize_url(source_url)
 
+    instagram_error = None
     if is_instagram(url):
-        return _ig_download(url)
+        try:
+            return _ig_download(url, source_url=source_url, on_item=on_item)
+        except DownloadError as e:
+            instagram_error = e
+            logger.debug("Instagram native download failed, trying yt-dlp fallback: %s", e)
 
     tmp_dir = f"/tmp/bot_{uuid.uuid4().hex}"
     os.makedirs(tmp_dir, exist_ok=True)
@@ -512,6 +797,7 @@ def download_media(url: str) -> list:
         "format": "best[ext=mp4][filesize<50M]/best[filesize<50M]/best[ext=mp4]/best",
         "quiet": True,
         "no_warnings": True,
+        "noprogress": True,
         "http_headers": YDL_HTTP_HEADERS,
     }
 
@@ -562,6 +848,9 @@ def download_media(url: str) -> list:
         return results
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if instagram_error:
+        raise instagram_error
 
     # gallery-dl fallback for Threads
     if is_threads(url):
