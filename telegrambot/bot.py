@@ -78,6 +78,11 @@ async def _download_and_send_instagram(update: Update, context: ContextTypes.DEF
     worker_task = asyncio.create_task(asyncio.to_thread(worker))
     sent = 0
     status_deleted = False
+    dirs_to_clean = set()
+
+    def cleanup_download_dirs():
+        for d in dirs_to_clean:
+            shutil.rmtree(d, ignore_errors=True)
 
     while True:
         item = await asyncio.to_thread(item_queue.get)
@@ -85,6 +90,8 @@ async def _download_and_send_instagram(update: Update, context: ContextTypes.DEF
             break
 
         sent += 1
+        if item.get("_dir"):
+            dirs_to_clean.add(item["_dir"])
         if not status_deleted:
             try:
                 await status.delete()
@@ -114,6 +121,7 @@ async def _download_and_send_instagram(update: Update, context: ContextTypes.DEF
                 await update.message.reply_text(str(result["error"]))
             else:
                 await status.edit_text(str(result["error"]))
+            cleanup_download_dirs()
             return
 
         logger.error(f"Error in download_media: {result['error']}")
@@ -121,6 +129,7 @@ async def _download_and_send_instagram(update: Update, context: ContextTypes.DEF
             await update.message.reply_text("Error inesperado al descargar el contenido.")
         else:
             await status.edit_text("Error inesperado al descargar el contenido.")
+        cleanup_download_dirs()
         return
 
     if not sent:
@@ -128,8 +137,10 @@ async def _download_and_send_instagram(update: Update, context: ContextTypes.DEF
             "No pude obtener el contenido de Instagram.\n"
             "El post puede ser privado o el link inválido."
         )
+        cleanup_download_dirs()
         return
 
+    cleanup_download_dirs()
     logger.info(f"Sent {sent} Instagram item(s) to user {user.id}")
 
 BASE_DIR = Path(__file__).parent

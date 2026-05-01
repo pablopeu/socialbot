@@ -844,7 +844,10 @@ def download_media(url: str, on_item=None) -> list:
             ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
             mime = MIME_MAP.get(ext, "application/octet-stream")
             ftype = "video" if "video" in mime else "image"
-            results.append({"type": ftype, "path": fpath, "mime": mime, "_dir": tmp_dir})
+            item = {"type": ftype, "path": fpath, "mime": mime, "_dir": tmp_dir}
+            results.append(item)
+            if on_item:
+                on_item(item)
         return results
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
