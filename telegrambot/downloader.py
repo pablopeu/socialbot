@@ -781,8 +781,13 @@ def download_media(url: str, on_item=None) -> list:
     source_url = url.strip()
     url = _normalize_url(source_url)
 
+    instagram_error = None
     if is_instagram(url):
-        return _ig_download(url, source_url=source_url, on_item=on_item)
+        try:
+            return _ig_download(url, source_url=source_url, on_item=on_item)
+        except DownloadError as e:
+            instagram_error = e
+            logger.debug("Instagram native download failed, trying yt-dlp fallback: %s", e)
 
     tmp_dir = f"/tmp/bot_{uuid.uuid4().hex}"
     os.makedirs(tmp_dir, exist_ok=True)
@@ -792,6 +797,7 @@ def download_media(url: str, on_item=None) -> list:
         "format": "best[ext=mp4][filesize<50M]/best[filesize<50M]/best[ext=mp4]/best",
         "quiet": True,
         "no_warnings": True,
+        "noprogress": True,
         "http_headers": YDL_HTTP_HEADERS,
     }
 
@@ -842,6 +848,9 @@ def download_media(url: str, on_item=None) -> list:
         return results
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if instagram_error:
+        raise instagram_error
 
     # gallery-dl fallback for Threads
     if is_threads(url):
