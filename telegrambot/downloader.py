@@ -68,6 +68,22 @@ INSTAGRAM_SAVEINSTA_PAGE_URL = os.getenv(
     "SOCIALBOT_INSTAGRAM_SAVEINSTA_PAGE_URL",
     "https://saveinsta.io/en/story-downloader",
 )
+INSTAGRAM_DOWNREELS_API_URL = os.getenv(
+    "SOCIALBOT_INSTAGRAM_DOWNREELS_API_URL",
+    "https://downreels.com/api/fetch.php",
+)
+INSTAGRAM_FASTVIDL_API_URL = os.getenv(
+    "SOCIALBOT_INSTAGRAM_FASTVIDL_API_URL",
+    "https://fastvidl.com/api/lookup",
+)
+INSTAGRAM_NUELINK_API_URL = os.getenv(
+    "SOCIALBOT_INSTAGRAM_NUELINK_API_URL",
+    "https://tools.nuelink.com/api/socialVideoDownloader/instagram/getDownloadLink",
+)
+INSTAGRAM_LISTNR_API_URL = os.getenv(
+    "SOCIALBOT_INSTAGRAM_LISTNR_API_URL",
+    "https://bff.listnr.tech/backend/user/getInfoYT",
+)
 INSTAGRAM_USE_COOKIES = os.getenv(
     "SOCIALBOT_INSTAGRAM_USE_COOKIES", "0"
 ).lower() in {"1", "true", "yes", "on"}
@@ -80,12 +96,41 @@ class DownloadError(Exception):
     """User-facing download error."""
 
 
+class _RouteTrace:
+    """Accumulates per-route failure reasons for Instagram diagnostics.
+
+    Each route (direct instaloader, fixers, yt-dlp) appends a short reason when
+    it fails. The summary feeds the admin alert body; the key (sorted route
+    names) drives edge-triggered dedup so repeated identical failures only
+    notify once and a success rearms the alert.
+    """
+
+    def __init__(self):
+        self._entries = []  # list of (route, reason)
+
+    def add(self, route: str, reason: str):
+        self._entries.append((route, str(reason)))
+
+    def key(self) -> str:
+        names = sorted({route for route, _ in self._entries})
+        return ";".join(names) if names else "instagram"
+
+    def summary(self) -> str:
+        if not self._entries:
+            return ""
+        return "; ".join(f"{route}: {reason}" for route, reason in self._entries)
+
+
 def instagram_status() -> dict:
     return {
         "fixer_hosts": list(INSTAGRAM_FIXER_HOSTS),
         "fixer_verify_ssl": INSTAGRAM_FIXER_VERIFY_SSL,
         "use_cookies": INSTAGRAM_USE_COOKIES,
         "max_carousel_items": INSTAGRAM_MAX_CAROUSEL_ITEMS,
+        "downreels_enabled": bool(INSTAGRAM_DOWNREELS_API_URL),
+        "fastvidl_enabled": bool(INSTAGRAM_FASTVIDL_API_URL),
+        "nuelink_enabled": bool(INSTAGRAM_NUELINK_API_URL),
+        "listnr_enabled": bool(INSTAGRAM_LISTNR_API_URL),
     }
 
 
@@ -430,6 +475,215 @@ def _ig_download_story_via_saveinsta(url: str, on_item=None) -> list:
     return results
 
 
+def _ig_download_via_downreels(url: str, on_item=None, trace: _RouteTrace = None) -> list:
+    """Use downreels.com's JSON API, which resolves direct fbcdn media URLs."""
+    if not INSTAGRAM_DOWNREELS_API_URL:
+        return []
+
+    try:
+        with httpx.Client(timeout=30) as client:
+            r = client.post(
+                INSTAGRAM_DOWNREELS_API_URL,
+                headers={
+                    "User-Agent": BROWSER_HEADERS["User-Agent"],
+                    "Content-Type": "application/json",
+                    "Referer": "https://downreels.com/",
+                },
+                json={"url": url},
+            )
+            if r.status_code != 200:
+                logger.debug("downreels HTTP %s", r.status_code)
+                if trace:
+                    trace.add("downreels", f"http {r.status_code}")
+                return []
+            payload = r.json()
+    except Exception as e:
+        logger.debug("downreels request failed: %s", e)
+        if trace:
+            trace.add("downreels", "error")
+        return []
+
+    entries = payload.get("videos")
+    if payload.get("status") != "ok" or not entries:
+        if trace:
+            trace.add("downreels", "sin media")
+        return []
+
+    results = []
+    seen = set()
+    seen_hashes = set()
+    for entry in entries:
+        media_url = entry.get("url")
+        if not media_url or media_url in seen:
+            continue
+        seen.add(media_url)
+        item_type = "video" if entry.get("isVideo", True) else "image"
+        downloaded = _download_cdn_url(media_url, item_type, headers=BROWSER_HEADERS)
+        if downloaded:
+            _emit_downloaded_item(downloaded, results, on_item, seen_hashes=seen_hashes)
+
+    if results:
+        logger.info("Instagram media downloaded via downreels")
+        if trace:
+            trace.add("downreels", "ok")
+    elif trace:
+        trace.add("downreels", "cdn sin descargas")
+    return results
+
+
+def _ig_download_via_fastvidl(url: str, on_item=None, trace: _RouteTrace = None) -> list:
+    """Use fastvidl.com's JSON API, which resolves direct CDN media URLs."""
+    if not INSTAGRAM_FASTVIDL_API_URL:
+        return []
+
+    try:
+        with httpx.Client(timeout=30) as client:
+            r = client.post(
+                INSTAGRAM_FASTVIDL_API_URL,
+                headers={
+                    "User-Agent": BROWSER_HEADERS["User-Agent"],
+                    "Content-Type": "application/json",
+                    "Referer": "https://fastvidl.com/instagram-video-downloader-free",
+                },
+                json={"url": url},
+            )
+            if r.status_code != 200:
+                logger.debug("fastvidl HTTP %s", r.status_code)
+                if trace:
+                    trace.add("fastvidl", f"http {r.status_code}")
+                return []
+            payload = r.json()
+    except Exception as e:
+        logger.debug("fastvidl request failed: %s", e)
+        if trace:
+            trace.add("fastvidl", "error")
+        return []
+
+    entries = payload.get("media")
+    if not payload.get("ok") or not entries:
+        if trace:
+            trace.add("fastvidl", "sin media")
+        return []
+
+    results = []
+    seen = set()
+    seen_hashes = set()
+    for entry in entries:
+        media_url = entry.get("url")
+        if not media_url or media_url in seen:
+            continue
+        seen.add(media_url)
+        item_type = "video" if entry.get("type") == "video" else "image"
+        downloaded = _download_cdn_url(media_url, item_type, headers=BROWSER_HEADERS)
+        if downloaded:
+            _emit_downloaded_item(downloaded, results, on_item, seen_hashes=seen_hashes)
+
+    if results:
+        logger.info("Instagram media downloaded via fastvidl")
+        if trace:
+            trace.add("fastvidl", "ok")
+    elif trace:
+        trace.add("fastvidl", "cdn sin descargas")
+    return results
+
+
+def _ig_download_via_nuelink(url: str, on_item=None, trace: _RouteTrace = None) -> list:
+    """Use nuelink.com's API, which mirrors the media to its own storage."""
+    if not INSTAGRAM_NUELINK_API_URL:
+        return []
+
+    try:
+        with httpx.Client(timeout=30) as client:
+            r = client.get(
+                INSTAGRAM_NUELINK_API_URL,
+                params={"link": url},
+                headers={
+                    "User-Agent": BROWSER_HEADERS["User-Agent"],
+                    "Referer": "https://nuelink.com/tools/instagram-video-downloader",
+                },
+            )
+            if r.status_code != 200:
+                logger.debug("nuelink HTTP %s", r.status_code)
+                if trace:
+                    trace.add("nuelink", f"http {r.status_code}")
+                return []
+            payload = r.json()
+    except Exception as e:
+        logger.debug("nuelink request failed: %s", e)
+        if trace:
+            trace.add("nuelink", "error")
+        return []
+
+    media_url = payload.get("data")
+    if payload.get("error") or not media_url:
+        if trace:
+            trace.add("nuelink", "sin media")
+        return []
+
+    item_type = "image" if re.search(r"\.(jpg|jpeg|png|webp)(\?|$)", media_url, re.I) else "video"
+    downloaded = _download_cdn_url(media_url, item_type, headers=BROWSER_HEADERS)
+    results = []
+    if downloaded:
+        _emit_downloaded_item(downloaded, results, on_item)
+
+    if results:
+        logger.info("Instagram media downloaded via nuelink")
+        if trace:
+            trace.add("nuelink", "ok")
+    elif trace:
+        trace.add("nuelink", "cdn sin descargas")
+    return results
+
+
+def _ig_download_via_listnr(url: str, on_item=None, trace: _RouteTrace = None) -> list:
+    """Use listnr.ai's API, which proxies media via a signed JWT link."""
+    if not INSTAGRAM_LISTNR_API_URL:
+        return []
+
+    try:
+        with httpx.Client(timeout=30) as client:
+            r = client.post(
+                INSTAGRAM_LISTNR_API_URL,
+                headers={
+                    "User-Agent": BROWSER_HEADERS["User-Agent"],
+                    "Content-Type": "application/json",
+                    "Referer": "https://listnr.ai/instagram-video-downloader",
+                    "Origin": "https://listnr.ai",
+                },
+                json={"url": url, "platform": "instagram", "type": "video"},
+            )
+            if r.status_code != 200:
+                logger.debug("listnr HTTP %s", r.status_code)
+                if trace:
+                    trace.add("listnr", f"http {r.status_code}")
+                return []
+            payload = r.json()
+    except Exception as e:
+        logger.debug("listnr request failed: %s", e)
+        if trace:
+            trace.add("listnr", "error")
+        return []
+
+    media_url = payload.get("url")
+    if not media_url:
+        if trace:
+            trace.add("listnr", "sin media")
+        return []
+
+    downloaded = _download_cdn_url(media_url, "video", headers=BROWSER_HEADERS)
+    results = []
+    if downloaded:
+        _emit_downloaded_item(downloaded, results, on_item)
+
+    if results:
+        logger.info("Instagram media downloaded via listnr")
+        if trace:
+            trace.add("listnr", "ok")
+    elif trace:
+        trace.add("listnr", "cdn sin descargas")
+    return results
+
+
 def _ig_collect_fixer_items(client: httpx.Client, host: str, url: str) -> list:
     path = _ig_path_from_url(url)
     if not path or not INSTAGRAM_FIXER_HOSTS:
@@ -445,7 +699,7 @@ def _ig_collect_fixer_items(client: httpx.Client, host: str, url: str) -> list:
     return _extract_og_media_items(r.text)
 
 
-def _ig_download_via_fixers(url: str, source_url: str = None, on_item=None) -> list:
+def _ig_download_via_fixers(url: str, source_url: str = None, on_item=None, trace: _RouteTrace = None) -> list:
     path = _ig_path_from_url(url)
     if not path or not INSTAGRAM_FIXER_HOSTS:
         return []
@@ -456,12 +710,14 @@ def _ig_download_via_fixers(url: str, source_url: str = None, on_item=None) -> l
     requested_img_index = _ig_img_index_from_url(source_url)
     should_probe_carousel = is_post and not prefer_video
 
+    host_outcomes = []
     for host in INSTAGRAM_FIXER_HOSTS:
         results = []
         items = []
         seen = set()
         seen_hashes = set()
         duplicate_or_empty_seen = False
+        host_reason = None
         try:
             with httpx.Client(
                 follow_redirects=True,
@@ -486,24 +742,21 @@ def _ig_download_via_fixers(url: str, source_url: str = None, on_item=None) -> l
                                 break
         except Exception as e:
             logger.debug(f"Instagram fixer {host} request failed: {e}")
+            host_outcomes.append(f"{host}=error")
             continue
 
         if not items:
-            logger.debug(f"Instagram fixer {host} returned no og media tags")
-            continue
-        if prefer_video and not any(item["type"] == "video" for item in items):
-            logger.debug(f"Instagram fixer {host} returned only images for reel/tv")
-            continue
-        if requested_img_index and len(items) < requested_img_index:
-            logger.debug(
-                "Instagram fixer %s only exposed %s/%s carousel items",
-                host,
-                len(items),
-                requested_img_index,
-            )
-            continue
-        if should_probe_carousel and len(items) == 1 and not duplicate_or_empty_seen:
-            logger.debug(f"Instagram fixer {host} did not finish carousel probing")
+            host_reason = "sin media"
+        elif prefer_video and not any(item["type"] == "video" for item in items):
+            host_reason = "solo imágenes"
+        elif requested_img_index and len(items) < requested_img_index:
+            host_reason = "carousel incompleto"
+        elif should_probe_carousel and len(items) == 1 and not duplicate_or_empty_seen:
+            host_reason = "carousel sin probing"
+
+        if host_reason:
+            logger.debug(f"Instagram fixer {host}: {host_reason}")
+            host_outcomes.append(f"{host}={host_reason}")
             continue
 
         for item in items:
@@ -526,6 +779,7 @@ def _ig_download_via_fixers(url: str, source_url: str = None, on_item=None) -> l
                     host,
                     status_code,
                 )
+                host_reason = f"cdn {status_code}"
                 results = []
                 break
             elif status_code:
@@ -535,12 +789,16 @@ def _ig_download_via_fixers(url: str, source_url: str = None, on_item=None) -> l
                     status_code,
                     item["type"],
                 )
+                if not host_reason:
+                    host_reason = f"cdn {status_code}"
             else:
                 logger.debug(
                     "Instagram fixer %s media download failed without HTTP status for %s",
                     host,
                     item["type"],
                 )
+                if not host_reason:
+                    host_reason = "cdn sin status"
 
         if results:
             if requested_img_index and len(results) < requested_img_index:
@@ -555,14 +813,23 @@ def _ig_download_via_fixers(url: str, source_url: str = None, on_item=None) -> l
                         os.unlink(item["path"])
                     except FileNotFoundError:
                         pass
+                host_outcomes.append(f"{host}=carousel incompleto descarga")
                 continue
             logger.info(f"Instagram media downloaded via fixer {host}")
+            if trace:
+                trace.add("fixers", f"ok vía {host}")
             return results
 
+        host_outcomes.append(f"{host}={host_reason or 'sin media descargable'}")
+
+    summary = ", ".join(host_outcomes) if host_outcomes else "sin hosts"
+    logger.info(f"Instagram fixers no resolvieron el post: {summary}")
+    if trace:
+        trace.add("fixers", summary)
     return []
 
 
-def _ig_download_direct(url: str, on_item=None) -> list:
+def _ig_download_direct(url: str, on_item=None, trace: _RouteTrace = None) -> list:
     """Use anonymous Instaloader access for public Instagram posts."""
     shortcode = _ig_shortcode_from_url(url)
     if not shortcode:
@@ -585,10 +852,14 @@ def _ig_download_direct(url: str, on_item=None) -> list:
         message = str(e)
         if _is_instagram_auth_or_rate_limit_error(message):
             _trip_instagram_circuit(message)
+            if trace:
+                trace.add("direct", "bloqueo auth (graphql)")
             raise DownloadError(
                 "Instagram bloqueó el acceso público desde esta VM. "
                 "El bot no usa ninguna cuenta de Instagram."
             ) from e
+        if trace:
+            trace.add("direct", "post no extraíble")
         raise DownloadError(
             "No pude extraer ese post de Instagram en modo anónimo."
         ) from e
@@ -606,6 +877,8 @@ def _ig_download_direct(url: str, on_item=None) -> list:
         items.append({"type": "image", "cdn_url": post.url})
 
     if not items:
+        if trace:
+            trace.add("direct", "sin media")
         raise DownloadError("Instagram no devolvió medios para ese post.")
 
     results = []
@@ -625,41 +898,71 @@ def _ig_download_direct(url: str, on_item=None) -> list:
             )
         elif status_code in (401, 403, 429):
             _trip_instagram_circuit(f"cdn http {status_code}")
+            if trace:
+                trace.add("direct", f"cdn {status_code}")
             raise DownloadError(
                 "Instagram bloqueó la descarga pública desde esta VM."
             )
     if results:
         return results
 
+    if trace:
+        trace.add("direct", "cdn sin descargas")
     raise DownloadError(
         "Instagram resolvió el post, pero no pude bajar los archivos desde la CDN."
     )
 
 
-def _ig_download(url: str, source_url: str = None, on_item=None) -> list:
+def _ig_download(url: str, source_url: str = None, on_item=None, trace: _RouteTrace = None) -> list:
     source_url = source_url or url
     if _ig_story_path_from_url(url):
         fixer_results = _ig_download_via_fixers(
-            url, source_url=source_url, on_item=on_item
+            url, source_url=source_url, on_item=on_item, trace=trace
         )
         if fixer_results:
             return fixer_results
         saveinsta_results = _ig_download_story_via_saveinsta(url, on_item=on_item)
         if saveinsta_results:
             return saveinsta_results
+        downreels_results = _ig_download_via_downreels(url, on_item=on_item, trace=trace)
+        if downreels_results:
+            return downreels_results
+        fastvidl_results = _ig_download_via_fastvidl(url, on_item=on_item, trace=trace)
+        if fastvidl_results:
+            return fastvidl_results
+        nuelink_results = _ig_download_via_nuelink(url, on_item=on_item, trace=trace)
+        if nuelink_results:
+            return nuelink_results
+        listnr_results = _ig_download_via_listnr(url, on_item=on_item, trace=trace)
+        if listnr_results:
+            return listnr_results
+        if trace:
+            trace.add("story", "no disponible")
         raise DownloadError(
             "No pude obtener esa historia de Instagram con los métodos alternativos. "
             "Puede haber vencido, ser privada o no estar disponible públicamente."
         )
 
     try:
-        return _ig_download_direct(url, on_item=on_item)
+        return _ig_download_direct(url, on_item=on_item, trace=trace)
     except DownloadError as direct_error:
         fixer_results = _ig_download_via_fixers(
-            url, source_url=source_url, on_item=on_item
+            url, source_url=source_url, on_item=on_item, trace=trace
         )
         if fixer_results:
             return fixer_results
+        downreels_results = _ig_download_via_downreels(url, on_item=on_item, trace=trace)
+        if downreels_results:
+            return downreels_results
+        fastvidl_results = _ig_download_via_fastvidl(url, on_item=on_item, trace=trace)
+        if fastvidl_results:
+            return fastvidl_results
+        nuelink_results = _ig_download_via_nuelink(url, on_item=on_item, trace=trace)
+        if nuelink_results:
+            return nuelink_results
+        listnr_results = _ig_download_via_listnr(url, on_item=on_item, trace=trace)
+        if listnr_results:
+            return listnr_results
         raise direct_error
 
 
@@ -786,9 +1089,12 @@ def download_media(url: str, on_item=None) -> list:
     url = _normalize_url(source_url)
 
     instagram_error = None
+    instagram_trace = _RouteTrace()
     if is_instagram(url):
         try:
-            return _ig_download(url, source_url=source_url, on_item=on_item)
+            return _ig_download(
+                url, source_url=source_url, on_item=on_item, trace=instagram_trace
+            )
         except DownloadError as e:
             instagram_error = e
             logger.debug("Instagram native download failed, trying yt-dlp fallback: %s", e)
@@ -830,16 +1136,21 @@ def download_media(url: str, on_item=None) -> list:
     except Exception as e:
         logger.error(f"yt-dlp error for {url}: {e}")
         if is_instagram(url) and _is_instagram_auth_or_rate_limit_error(str(e)):
+            instagram_trace.add("yt-dlp", "auth/rate-limit")
             shutil.rmtree(tmp_dir, ignore_errors=True)
             if cookiefile:
-                raise DownloadError(
+                err = DownloadError(
                     "Instagram bloqueó temporalmente la sesión o las cookies vencieron. "
                     "Esperá unos minutos, renová `cookies.txt` y reintentá."
-                ) from e
-            raise DownloadError(
-                "Instagram bloqueó el acceso anónimo desde esta VM. "
-                "El bot no usa ninguna cuenta de Instagram."
-            ) from e
+                )
+            else:
+                err = DownloadError(
+                    "Instagram bloqueó el acceso anónimo desde esta VM. "
+                    "El bot no usa ninguna cuenta de Instagram."
+                )
+            err.route_trace = instagram_trace.summary()
+            err.route_key = instagram_trace.key()
+            raise err from e
 
     if ytdlp_ok:
         results = []
@@ -857,6 +1168,9 @@ def download_media(url: str, on_item=None) -> list:
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
     if instagram_error:
+        instagram_trace.add("yt-dlp", "sin salida")
+        instagram_error.route_trace = instagram_trace.summary()
+        instagram_error.route_key = instagram_trace.key()
         raise instagram_error
 
     # gallery-dl fallback for Threads

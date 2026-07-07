@@ -115,8 +115,16 @@ async def _download_and_send_instagram(update: Update, context: ContextTypes.DEF
 
     if result["error"]:
         if isinstance(result["error"], DownloadError):
-            logger.error(f"Download error for {text}: {result['error']}")
-            await _maybe_notify_instagram_admin(context, user.id, text, str(result["error"]))
+            err = result["error"]
+            logger.error(f"Download error for {text}: {err}")
+            await _maybe_notify_instagram_admin(
+                context,
+                user.id,
+                text,
+                str(err),
+                route_trace=getattr(err, "route_trace", ""),
+                route_key=getattr(err, "route_key", "instagram"),
+            )
             if sent:
                 await update.message.reply_text(str(result["error"]))
             else:
@@ -140,6 +148,7 @@ async def _download_and_send_instagram(update: Update, context: ContextTypes.DEF
         cleanup_download_dirs()
         return
 
+    await _rearm_instagram_alert()
     cleanup_download_dirs()
     logger.info(f"Sent {sent} Instagram item(s) to user {user.id}")
 
@@ -220,17 +229,32 @@ async def _maybe_notify_instagram_admin(
     requested_by: int,
     url: str,
     error_text: str,
+    route_trace: str = "",
+    route_key: str = "instagram",
 ):
+    """Notify the admin once per consecutive Instagram failure run.
+
+    Edge-triggered by `route_key`: the first time a given failure signature is
+    seen we send the alert and record it as active; subsequent identical
+    failures are suppressed. A successful download clears the active key via
+    `_rearm_instagram_alert`, so the next failure (even the same kind) notifies
+    again.
+    """
     admin_id = get_admin_id()
     if not admin_id or not _should_notify_instagram_admin(error_text):
         return
 
-    today = datetime.now().date().isoformat()
+    key = route_key or "instagram"
     async with INSTAGRAM_ALERT_LOCK:
         state = _load_instagram_alert_state()
-        if state.get("instagram_failure_alert_date") == today:
+        if state.get("active_failure_key") == key:
+            logger.info(
+                "Instagram: fallo consecutivo '%s', alerta ya enviada (suprimida).",
+                key,
+            )
             return
 
+        today = datetime.now().date().isoformat()
         message = (
             "Alerta Instagram: fallaron todas las rutas del bot para un link.\n"
             f"Fecha: {today}\n"
@@ -238,6 +262,8 @@ async def _maybe_notify_instagram_admin(
             f"URL: {url}\n"
             f"Error: {error_text}"
         )
+        if route_trace:
+            message += f"\nRutas: {route_trace}"
         try:
             await context.bot.send_message(
                 chat_id=admin_id,
@@ -248,11 +274,32 @@ async def _maybe_notify_instagram_admin(
             logger.error(f"Failed to send Instagram admin alert: {e}")
             return
 
-        state["instagram_failure_alert_date"] = today
-        state["instagram_failure_alert_url"] = url
-        state["instagram_failure_alert_error"] = error_text
-        state["instagram_failure_alert_requested_by"] = requested_by
+        state["active_failure_key"] = key
+        state["last_notified_at"] = datetime.now().isoformat(timespec="seconds")
+        for stale in (
+            "instagram_failure_alert_date",
+            "instagram_failure_alert_url",
+            "instagram_failure_alert_error",
+            "instagram_failure_alert_requested_by",
+        ):
+            state.pop(stale, None)
         _save_instagram_alert_state(state)
+
+
+async def _rearm_instagram_alert():
+    """Clear the active Instagram failure so the next failure notifies again.
+
+    Called whenever an Instagram download succeeds: a working request means the
+    earlier failure recovered on its own, so we rearm the alert.
+    """
+    async with INSTAGRAM_ALERT_LOCK:
+        state = _load_instagram_alert_state()
+        if not state.get("active_failure_key"):
+            return
+        state.pop("active_failure_key", None)
+        state["rearmed_at"] = datetime.now().isoformat(timespec="seconds")
+        _save_instagram_alert_state(state)
+        logger.info("Instagram se recuperó: alerta rearada.")
 
 
 # --- Handlers ---
@@ -376,10 +423,23 @@ async def cmd_instagram_status(update: Update, context: ContextTypes.DEFAULT_TYP
     lines.append(
         f"Verificacion SSL fixers: {'on' if status['fixer_verify_ssl'] else 'off'}"
     )
-    if alert_state.get("instagram_failure_alert_date"):
-        lines.append(f"Ultima alerta admin: {alert_state['instagram_failure_alert_date']}")
+    lines.append(
+        f"Downreels: {'on' if status['downreels_enabled'] else 'off'}"
+    )
+    lines.append(
+        f"Fastvidl: {'on' if status['fastvidl_enabled'] else 'off'}"
+    )
+    lines.append(
+        f"Nuelink: {'on' if status['nuelink_enabled'] else 'off'}"
+    )
+    lines.append(
+        f"Listnr: {'on' if status['listnr_enabled'] else 'off'}"
+    )
+    if alert_state.get("active_failure_key"):
+        lines.append(f"Fallo activo: {alert_state['active_failure_key']}")
+        lines.append(f"Ultima alerta: {alert_state.get('last_notified_at', '?')}")
     else:
-        lines.append("Ultima alerta admin: ninguna")
+        lines.append("Fallo activo: ninguno (alerta armada)")
 
     await update.message.reply_text("\n".join(lines))
 
