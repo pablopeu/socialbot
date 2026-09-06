@@ -1079,6 +1079,24 @@ def _threads_scrape(url: str) -> Optional[list]:
     return None
 
 
+def _post_text_from_info(info) -> str:
+    """Extract the post text from yt-dlp metadata (tweet text lives in description)."""
+    if not isinstance(info, dict):
+        return ""
+    text = (info.get("description") or "").strip()
+    if text:
+        return text
+    entries = info.get("entries")
+    if isinstance(entries, list):
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            candidate = (entry.get("description") or entry.get("title") or "").strip()
+            if candidate:
+                return candidate
+    return ""
+
+
 def download_media(url: str, on_item=None) -> list:
     """
     Download all media from a URL.
@@ -1125,9 +1143,10 @@ def download_media(url: str, on_item=None) -> list:
         logger.warning("Instagram request without cookies.txt configured")
 
     ytdlp_ok = False
+    info = None
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+            info = ydl.extract_info(url, download=True)
         files = sorted([
             f for f in os.listdir(tmp_dir)
             if not f.endswith((".part", ".ytdl"))
@@ -1153,6 +1172,7 @@ def download_media(url: str, on_item=None) -> list:
             raise err from e
 
     if ytdlp_ok:
+        post_text = _post_text_from_info(info) if is_twitter(url) else ""
         results = []
         for fname in sorted([f for f in os.listdir(tmp_dir) if not f.endswith((".part", ".ytdl"))]):
             fpath = os.path.join(tmp_dir, fname)
@@ -1160,6 +1180,8 @@ def download_media(url: str, on_item=None) -> list:
             mime = MIME_MAP.get(ext, "application/octet-stream")
             ftype = "video" if "video" in mime else "image"
             item = {"type": ftype, "path": fpath, "mime": mime, "_dir": tmp_dir}
+            if post_text:
+                item["post_text"] = post_text
             results.append(item)
             if on_item:
                 on_item(item)

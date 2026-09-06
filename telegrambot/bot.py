@@ -36,6 +36,22 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
+TELEGRAM_CAPTION_LIMIT = 1024
+
+
+def _caption_with_post_text(post_text: str, base_caption: str) -> str:
+    post_text = (post_text or "").strip()
+    if not post_text:
+        return base_caption
+    caption = f"{post_text}\n\n{base_caption}"
+    if len(caption) <= TELEGRAM_CAPTION_LIMIT:
+        return caption
+    budget = TELEGRAM_CAPTION_LIMIT - len(base_caption) - 4  # "\n\n" + "…"
+    if budget < 1:
+        return base_caption
+    return f"{post_text[:budget].rstrip()}…\n\n{base_caption}"
+
+
 async def _send_downloaded_item(update: Update, item: dict, caption: str):
     path = item["path"]
     try:
@@ -500,6 +516,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for i, item in enumerate(items, 1):
         caption = f"{i}/{total} — {text}" if total > 1 else text
+        caption = _caption_with_post_text(item.get("post_text"), caption)
         if item.get("_dir"):
             dirs_to_clean.add(item["_dir"])
 
