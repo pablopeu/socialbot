@@ -87,11 +87,13 @@ Verificar que SSH funciona por ZeroTier antes de cerrar el puerto 22 público en
 
 ```bash
 sudo apt update && sudo apt upgrade -y
-sudo apt install python3-pip git -y
+sudo apt install python3-pip git ffmpeg -y
 git clone https://github.com/pablopeu/socialbot.git
 cd socialbot/telegrambot
 pip3 install -r requirements.txt
 ```
+
+`ffmpeg` es necesario para comprimir los videos que superan el límite de 50 MB de Telegram.
 
 ---
 

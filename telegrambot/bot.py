@@ -4,6 +4,7 @@ import logging
 import os
 import queue
 import shutil
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -39,6 +40,91 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 TELEGRAM_CAPTION_LIMIT = 1024
 POST_TEXT_PREVIEW_LIMIT = 200
 
+TELEGRAM_VIDEO_LIMIT_BYTES = 49 * 1024 * 1024  # la Bot API rechaza archivos de más de 50 MB
+COMPRESS_TARGET_BYTES = 46 * 1024 * 1024
+FFMPEG_BIN = shutil.which("ffmpeg")
+FFPROBE_BIN = shutil.which("ffprobe")
+
+
+def _probe_duration(path: str) -> float:
+    result = subprocess.run(
+        [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True, timeout=60,
+    )
+    return float(result.stdout.strip())
+
+
+def _compress_video(path: str) -> Optional[str]:
+    """Reencode a video to land under Telegram's 50 MB bot limit. None on failure."""
+    duration = _probe_duration(path)
+    if duration <= 0:
+        return None
+    video_bitrate = max(int(COMPRESS_TARGET_BYTES * 8 / duration) - 96_000, 40_000)
+    out_path = f"{path}.compressed.mp4"
+    passlog = f"{path}.passlog"
+    base = [
+        FFMPEG_BIN, "-y", "-i", path,
+        "-vf", "scale='min(1280,iw)':-2",
+        "-c:v", "libx264", "-preset", "veryfast", "-b:v", str(video_bitrate),
+        "-pix_fmt", "yuv420p",
+    ]
+    try:
+        subprocess.run(
+            base + ["-pass", "1", "-an", "-passlogfile", passlog, "-f", "mp4", "/dev/null"],
+            capture_output=True, timeout=900, check=True,
+        )
+        subprocess.run(
+            base + ["-pass", "2", "-passlogfile", passlog, "-c:a", "aac", "-b:a", "96k",
+                    "-movflags", "+faststart", out_path],
+            capture_output=True, timeout=900, check=True,
+        )
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
+        logger.warning(f"ffmpeg compression failed for {path}: {e}")
+        try:
+            os.unlink(out_path)
+        except FileNotFoundError:
+            pass
+        return None
+    finally:
+        for leftover in (f"{passlog}-0.log", f"{passlog}-0.log.mbtree"):
+            try:
+                os.unlink(leftover)
+            except FileNotFoundError:
+                pass
+    return out_path
+
+
+def _needs_compression(item: dict) -> bool:
+    return (
+        item.get("type") == "video"
+        and bool(FFMPEG_BIN and FFPROBE_BIN)
+        and os.path.getsize(item["path"]) > TELEGRAM_VIDEO_LIMIT_BYTES
+    )
+
+
+def _shrink_for_telegram(item: dict):
+    path = item["path"]
+    try:
+        logger.info(
+            f"Video de {os.path.getsize(path) / 1024 / 1024:.0f} MB supera el límite; comprimiendo..."
+        )
+        compressed = _compress_video(path)
+    except Exception as e:
+        logger.warning(f"No se pudo comprimir {path}: {e}")
+        return
+    if not compressed:
+        return
+    if os.path.getsize(compressed) <= TELEGRAM_VIDEO_LIMIT_BYTES:
+        os.unlink(path)
+        item["path"] = compressed
+        logger.info(
+            f"Video comprimido a {os.path.getsize(compressed) / 1024 / 1024:.0f} MB."
+        )
+    else:
+        os.unlink(compressed)
+        logger.warning("La compresión no bajó de 50 MB; el video queda por encima del límite.")
+
 
 def _caption_with_post_text(post_text: str, base_caption: str) -> str:
     post_text = (post_text or "").strip()
@@ -56,6 +142,13 @@ def _caption_with_post_text(post_text: str, base_caption: str) -> str:
 
 
 async def _send_downloaded_item(update: Update, item: dict, caption: str):
+    notice = None
+    if _needs_compression(item):
+        notice = await update.message.reply_text(
+            "El video supera los 50 MB de Telegram; lo comprimo antes de mandarlo. "
+            "Puede tardar unos minutos."
+        )
+    await asyncio.to_thread(_shrink_for_telegram, item)
     path = item["path"]
     try:
         with open(path, "rb") as f:
@@ -64,8 +157,8 @@ async def _send_downloaded_item(update: Update, item: dict, caption: str):
                     f,
                     caption=caption,
                     supports_streaming=True,
-                    read_timeout=120,
-                    write_timeout=120,
+                    read_timeout=600,
+                    write_timeout=600,
                 )
             else:
                 await update.message.reply_photo(f, caption=caption)
@@ -74,6 +167,11 @@ async def _send_downloaded_item(update: Update, item: dict, caption: str):
             try:
                 os.unlink(path)
             except FileNotFoundError:
+                pass
+        if notice:
+            try:
+                await notice.delete()
+            except TelegramError:
                 pass
 
 
