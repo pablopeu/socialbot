@@ -1080,21 +1080,25 @@ def _threads_scrape(url: str) -> Optional[list]:
 
 
 def _post_text_from_info(info) -> str:
-    """Extract the post text from yt-dlp metadata (tweet text lives in description)."""
+    """Extract the post text from yt-dlp metadata (tweet text lives in description).
+
+    t.co / pic.twitter.com shortcuts are dropped: the caption already carries
+    the X link, and t.co is just X's wrapper for the attached media.
+    """
     if not isinstance(info, dict):
         return ""
     text = (info.get("description") or "").strip()
-    if text:
-        return text
-    entries = info.get("entries")
-    if isinstance(entries, list):
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            candidate = (entry.get("description") or entry.get("title") or "").strip()
-            if candidate:
-                return candidate
-    return ""
+    if not text:
+        entries = info.get("entries")
+        if isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                candidate = (entry.get("description") or entry.get("title") or "").strip()
+                if candidate:
+                    text = candidate
+                    break
+    return re.sub(r"\s*(?:https?://)?(?:t\.co|pic\.twitter\.com)/\S+\s*", " ", text).strip()
 
 
 def download_media(url: str, on_item=None) -> list:
