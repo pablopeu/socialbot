@@ -90,6 +90,14 @@ INSTAGRAM_USE_COOKIES = os.getenv(
 INSTAGRAM_MAX_CAROUSEL_ITEMS = max(
     1, int(os.getenv("SOCIALBOT_INSTAGRAM_MAX_CAROUSEL_ITEMS", "20"))
 )
+TWITTER_FXTWITTER_API_URL = os.getenv(
+    "SOCIALBOT_TWITTER_FXTWITTER_API_URL",
+    "https://api.fxtwitter.com/status/{id}",
+)
+TWITTER_VXTWITTER_API_URL = os.getenv(
+    "SOCIALBOT_TWITTER_VXTWITTER_API_URL",
+    "https://api.vxtwitter.com/twitter/status/{id}",
+)
 
 
 class DownloadError(Exception):
@@ -1079,12 +1087,18 @@ def _threads_scrape(url: str) -> Optional[list]:
     return None
 
 
-def _post_text_from_info(info) -> str:
-    """Extract the post text from yt-dlp metadata (tweet text lives in description).
+_TWITTER_SHORTCUT_RE = re.compile(
+    r"\s*(?:https?://)?(?:t\.co|pic\.twitter\.com)/\S+\s*"
+)
 
-    t.co / pic.twitter.com shortcuts are dropped: the caption already carries
-    the X link, and t.co is just X's wrapper for the attached media.
-    """
+
+def _strip_twitter_shortcuts(text: str) -> str:
+    """Drop t.co / pic.twitter.com shortcuts: the caption already carries the X link."""
+    return _TWITTER_SHORTCUT_RE.sub(" ", text).strip()
+
+
+def _post_text_from_info(info) -> str:
+    """Extract the post text from yt-dlp metadata (tweet text lives in description)."""
     if not isinstance(info, dict):
         return ""
     text = (info.get("description") or "").strip()
@@ -1098,7 +1112,116 @@ def _post_text_from_info(info) -> str:
                 if candidate:
                     text = candidate
                     break
-    return re.sub(r"\s*(?:https?://)?(?:t\.co|pic\.twitter\.com)/\S+\s*", " ", text).strip()
+    return _strip_twitter_shortcuts(text)
+
+
+def _tweet_id_from_url(url: str) -> Optional[str]:
+    m = re.search(r"(?:twitter|x)\.com/[^/]+/status(?:es)?/(\d+)", url)
+    return m.group(1) if m else None
+
+
+_TWITTER_IMG_URL_RE = re.compile(
+    r"\.(?:jpe?g|png|webp)(?:[?#]|$)|[?&]format=(?:jpe?g|png|webp)", re.I
+)
+
+
+def _twitter_media_type(media_url: str, kind: str = "") -> str:
+    kind = (kind or "").lower()
+    if kind in ("photo", "image"):
+        return "image"
+    if kind in ("video", "gif"):
+        return "video"
+    if _TWITTER_IMG_URL_RE.search(media_url or ""):
+        return "image"
+    return "video"
+
+
+def _twitter_api_payload_media(payload) -> tuple:
+    """Extract (media_items, text) from fxtwitter or vxtwitter JSON responses."""
+    if not isinstance(payload, dict):
+        return [], ""
+    tweet = payload.get("tweet")
+    if isinstance(tweet, dict):  # fxtwitter shape
+        entries = (tweet.get("media") or {}).get("all") or []
+        text = (tweet.get("text") or "").strip()
+    else:  # vxtwitter shape
+        entries = payload.get("media_extended") or []
+        text = (payload.get("text") or "").strip()
+
+    items = []
+    seen = set()
+
+    def _add(media_url, kind):
+        if not media_url or media_url in seen:
+            return
+        seen.add(media_url)
+        items.append(
+            {"type": _twitter_media_type(media_url, kind), "cdn_url": media_url}
+        )
+
+    for entry in entries:
+        if isinstance(entry, dict):
+            _add(entry.get("url"), entry.get("type"))
+
+    if not items:  # vxtwitter also exposes a plain mediaURLs list
+        for media_url in payload.get("mediaURLs") or []:
+            _add(media_url, "")
+    return items, text
+
+
+def _twitter_download_via_apis(url: str, on_item=None) -> list:
+    """Download X post media via fxtwitter/vxtwitter public APIs.
+
+    yt-dlp fails on image-only tweets and on login-walled ones; these APIs
+    resolve both, including the post text.
+    """
+    tweet_id = _tweet_id_from_url(url)
+    if not tweet_id:
+        return []
+
+    api_headers = {
+        "User-Agent": YDL_HTTP_HEADERS["User-Agent"],
+        "Accept": "application/json",
+    }
+    media_headers = {
+        "User-Agent": YDL_HTTP_HEADERS["User-Agent"],
+        "Accept": "*/*",
+    }
+    for api_template in (TWITTER_FXTWITTER_API_URL, TWITTER_VXTWITTER_API_URL):
+        if not api_template:
+            continue
+        try:
+            with httpx.Client(timeout=30) as client:
+                r = client.get(api_template.format(id=tweet_id), headers=api_headers)
+                if r.status_code != 200:
+                    logger.debug("Twitter API %s HTTP %s", api_template, r.status_code)
+                    continue
+                payload = r.json()
+        except Exception as e:
+            logger.debug("Twitter API %s failed: %s", api_template, e)
+            continue
+
+        media_items, text = _twitter_api_payload_media(payload)
+        if not media_items:
+            continue
+
+        results = []
+        for item in media_items:
+            downloaded = _download_cdn_url(
+                item["cdn_url"], item["type"], headers=media_headers
+            )
+            if downloaded:
+                if text:
+                    downloaded["post_text"] = _strip_twitter_shortcuts(text)
+                results.append(downloaded)
+                if on_item:
+                    on_item(downloaded)
+        if results:
+            logger.info(
+                "Twitter media downloaded via %s", urlsplit(api_template).netloc
+            )
+            return results
+    return []
 
 
 def download_media(url: str, on_item=None) -> list:
@@ -1198,6 +1321,11 @@ def download_media(url: str, on_item=None) -> list:
         instagram_error.route_trace = instagram_trace.summary()
         instagram_error.route_key = instagram_trace.key()
         raise instagram_error
+
+    # fxtwitter/vxtwitter fallback: yt-dlp no resuelve posts solo-imagen ni
+    # los que piden login
+    if is_twitter(url):
+        return _twitter_download_via_apis(url, on_item=on_item)
 
     # gallery-dl fallback for Threads
     if is_threads(url):

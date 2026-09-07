@@ -37,12 +37,15 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 TELEGRAM_CAPTION_LIMIT = 1024
+POST_TEXT_PREVIEW_LIMIT = 200
 
 
 def _caption_with_post_text(post_text: str, base_caption: str) -> str:
     post_text = (post_text or "").strip()
     if not post_text:
         return base_caption
+    if len(post_text) > POST_TEXT_PREVIEW_LIMIT:
+        post_text = post_text[:POST_TEXT_PREVIEW_LIMIT].rstrip() + "…"
     caption = f"{post_text}\n\n{base_caption}"
     if len(caption) <= TELEGRAM_CAPTION_LIMIT:
         return caption
