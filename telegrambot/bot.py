@@ -16,6 +16,9 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from downloader import (
     DownloadError,
     download_media,
+    instagram_health_stale,
+    instagram_run_health_check,
+    instagram_seconds_until_next_check,
     instagram_status,
     is_instagram,
     is_twitter,
@@ -552,6 +555,20 @@ async def cmd_instagram_status(update: Update, context: ContextTypes.DEFAULT_TYP
     lines.append(
         f"Listnr: {'on' if status['listnr_enabled'] else 'off'}"
     )
+    lines.append(
+        f"Instapdown: {'on' if status['instapdown_enabled'] else 'off'}"
+    )
+    lines.append(f"Timeout por método: {status['probe_timeout_s']:.0f}s")
+    lines.append(f"Chequeo diario de salud: {status['health_check_time']} (Buenos Aires)")
+    health = status.get("health", {})
+    if health.get("date"):
+        lines.append(f"Ultimo chequeo: {health.get('checked_at', health['date'])}")
+        for name in sorted(health.get("methods", {})):
+            record = health["methods"][name]
+            state_txt = "vivo" if record.get("alive") else "MUERTO"
+            lines.append(f"  {name}: {state_txt} — {record.get('reason', '')}")
+    else:
+        lines.append("Chequeo de salud: sin datos (corre al iniciar o a la madrugada)")
     if alert_state.get("active_failure_key"):
         lines.append(f"Fallo activo: {alert_state['active_failure_key']}")
         lines.append(f"Ultima alerta: {alert_state.get('last_notified_at', '?')}")
@@ -559,6 +576,43 @@ async def cmd_instagram_status(update: Update, context: ContextTypes.DEFAULT_TYP
         lines.append("Fallo activo: ninguno (alerta armada)")
 
     await update.message.reply_text("\n".join(lines))
+
+
+# --- Chequeo diario de salud de métodos Instagram ---
+
+_HEALTH_LOOP_TASK = None
+
+
+async def _instagram_health_loop():
+    status = instagram_status()
+    logger.info(
+        "Loop de salud Instagram iniciado (chequeo diario a las %s hora Buenos Aires).",
+        status["health_check_time"],
+    )
+    while True:
+        try:
+            if instagram_health_stale():
+                logger.info("Instagram: chequeando salud de los métodos de descarga...")
+                state = await asyncio.to_thread(instagram_run_health_check)
+                methods = state.get("methods", {})
+                alive = [n for n, r in methods.items() if r.get("alive")]
+                logger.info(
+                    "Instagram salud: %d/%d métodos vivos.", len(alive), len(methods)
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"Instagram health check falló: {e}")
+            await asyncio.sleep(300)
+            continue
+        # Despierta a la madrugada del día siguiente, o antes si el estado
+        # quedó vencido (p. ej. tras un fallo total que invalidó el día).
+        await asyncio.sleep(min(instagram_seconds_until_next_check(), 1800))
+
+
+async def _start_instagram_health_loop(application: Application) -> None:
+    global _HEALTH_LOOP_TASK
+    _HEALTH_LOOP_TASK = asyncio.create_task(_instagram_health_loop())
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -640,7 +694,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     token = load_token()
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).post_init(_start_instagram_health_loop).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("agregar", cmd_agregar))
     app.add_handler(CommandHandler("borrar", cmd_borrar))

@@ -7,9 +7,12 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +87,13 @@ INSTAGRAM_LISTNR_API_URL = os.getenv(
     "SOCIALBOT_INSTAGRAM_LISTNR_API_URL",
     "https://bff.listnr.tech/backend/user/getInfoYT",
 )
+INSTAGRAM_INSTAPDOWN_API_URL = os.getenv(
+    "SOCIALBOT_INSTAGRAM_INSTAPDOWN_API_URL",
+    "https://instapdown.com/api/download",
+)
+INSTAGRAM_PROBE_TIMEOUT = float(
+    os.getenv("SOCIALBOT_INSTAGRAM_PROBE_TIMEOUT", "5")
+)
 INSTAGRAM_USE_COOKIES = os.getenv(
     "SOCIALBOT_INSTAGRAM_USE_COOKIES", "0"
 ).lower() in {"1", "true", "yes", "on"}
@@ -130,6 +140,7 @@ class _RouteTrace:
 
 
 def instagram_status() -> dict:
+    state = _load_health_state()
     return {
         "fixer_hosts": list(INSTAGRAM_FIXER_HOSTS),
         "fixer_verify_ssl": INSTAGRAM_FIXER_VERIFY_SSL,
@@ -139,11 +150,335 @@ def instagram_status() -> dict:
         "fastvidl_enabled": bool(INSTAGRAM_FASTVIDL_API_URL),
         "nuelink_enabled": bool(INSTAGRAM_NUELINK_API_URL),
         "listnr_enabled": bool(INSTAGRAM_LISTNR_API_URL),
+        "instapdown_enabled": bool(INSTAGRAM_INSTAPDOWN_API_URL),
+        "probe_timeout_s": INSTAGRAM_PROBE_TIMEOUT,
+        "health_check_time": (
+            f"{INSTAGRAM_HEALTH_CHECK_HOUR:02d}:{INSTAGRAM_HEALTH_CHECK_MINUTE:02d}"
+        ),
+        "health": {
+            "date": state.get("date"),
+            "checked_at": state.get("checked_at"),
+            "methods": state.get("methods", {}),
+        },
     }
 
 
 def _trip_instagram_circuit(reason: str):
     logger.warning("Instagram public access failed (%s)", reason)
+
+
+# --- Salud de métodos Instagram ---
+#
+# Cada madrugada (hora Buenos Aires) se sondea cada método contra un post
+# canario público y se persiste en instagram_health.json qué métodos viven.
+# Los muertos se saltean durante todo el día sin gastarles un solo request;
+# reviven en el chequeo del día siguiente. Si en vivo un método falla a nivel
+# de transporte (timeout, 5xx), se marca muerto para el resto del día.
+
+try:
+    BA_TZ = ZoneInfo("America/Argentina/Buenos_Aires")
+except Exception:
+    BA_TZ = timezone(timedelta(hours=-3))
+
+INSTAGRAM_HEALTH_CANARY_URL = os.getenv(
+    "SOCIALBOT_INSTAGRAM_HEALTH_CANARY",
+    "https://www.instagram.com/p/BsOGulcndj-/",
+)
+INSTAGRAM_HEALTH_CHECK_HOUR = int(os.getenv("SOCIALBOT_INSTAGRAM_HEALTH_HOUR", "4"))
+INSTAGRAM_HEALTH_CHECK_MINUTE = int(os.getenv("SOCIALBOT_INSTAGRAM_HEALTH_MINUTE", "30"))
+HEALTH_STATE_PATH = os.path.join(os.path.dirname(__file__), "instagram_health.json")
+
+_HEALTH_LOCK = threading.Lock()
+_HEALTH_STATE = None  # caché en memoria del último estado cargado/guardado
+
+
+def _health_today() -> str:
+    return datetime.now(BA_TZ).date().isoformat()
+
+
+def _health_exc_reason(e: Exception) -> str:
+    text = str(e).strip()
+    return f"{type(e).__name__}: {text[:80]}" if text else type(e).__name__
+
+
+def _load_health_state() -> dict:
+    global _HEALTH_STATE
+    if _HEALTH_STATE is None:
+        try:
+            with open(HEALTH_STATE_PATH) as f:
+                loaded = json.load(f)
+            _HEALTH_STATE = loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            _HEALTH_STATE = {}
+    return _HEALTH_STATE
+
+
+def _save_health_state_locked(state: dict):
+    global _HEALTH_STATE
+    _HEALTH_STATE = state
+    try:
+        with open(HEALTH_STATE_PATH, "w") as f:
+            json.dump(state, f, ensure_ascii=True, indent=2)
+            f.write("\n")
+    except Exception as e:
+        logger.warning(f"Failed to write Instagram health state: {e}")
+
+
+def instagram_health_stale() -> bool:
+    """True si no hay chequeo hecho hoy (hora Buenos Aires)."""
+    return _load_health_state().get("date") != _health_today()
+
+
+def method_alive(name: str) -> bool:
+    """True salvo que el chequeo de hoy haya marcado al método como muerto."""
+    state = _load_health_state()
+    if state.get("date") != _health_today():
+        return True
+    record = state.get("methods", {}).get(name)
+    if not isinstance(record, dict):
+        return True
+    return bool(record.get("alive"))
+
+
+def _mark_method_dead(name: str, reason: str):
+    with _HEALTH_LOCK:
+        state = _load_health_state()
+        today = _health_today()
+        if state.get("date") != today:
+            state = {"date": today, "methods": {}}
+        state.setdefault("methods", {})[name] = {
+            "alive": False,
+            "reason": str(reason)[:100],
+            "at": datetime.now(BA_TZ).isoformat(timespec="seconds"),
+        }
+        _save_health_state_locked(state)
+    logger.info(
+        "Instagram: método %s marcado MUERTO hasta el próximo chequeo (%s).",
+        name,
+        reason,
+    )
+
+
+def instagram_note_total_failure():
+    """Si falló todo y hoy no queda ningún método vivo, vencer el estado.
+
+    Cura el caso de un chequeo hecho durante un problema de red de la VM:
+    el próximo pedido (o el loop de salud) vuelve a probar todos los métodos.
+    """
+    with _HEALTH_LOCK:
+        state = _load_health_state()
+        if state.get("date") != _health_today():
+            return
+        methods = state.get("methods", {})
+        if methods and not any(
+            isinstance(r, dict) and r.get("alive") for r in methods.values()
+        ):
+            state["date"] = ""
+            _save_health_state_locked(state)
+            logger.warning(
+                "Instagram: ningún método vivo y falló todo; estado vencido "
+                "para re-chequear en el próximo pedido."
+            )
+
+
+def instagram_seconds_until_next_check() -> float:
+    now = datetime.now(BA_TZ)
+    target = now.replace(
+        hour=INSTAGRAM_HEALTH_CHECK_HOUR,
+        minute=INSTAGRAM_HEALTH_CHECK_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    if now >= target:
+        target += timedelta(days=1)
+    return max(1.0, (target - now).total_seconds() + 1)
+
+
+def _health_probe_direct(shortcode: str) -> tuple:
+    if not shortcode:
+        return (False, "canario inválido")
+    try:
+        L = _new_instaloader()
+        post = instaloader.Post.from_shortcode(L.context, shortcode)
+    except Exception as e:
+        return (False, _health_exc_reason(e))
+    return (True, f"ok ({post.typename})")
+
+
+def _health_probe_fixer(host: str, canary: str) -> tuple:
+    path = _ig_path_from_url(canary)
+    if not path:
+        return (False, "canario inválido")
+    try:
+        with httpx.Client(
+            follow_redirects=True,
+            timeout=INSTAGRAM_PROBE_TIMEOUT,
+            verify=INSTAGRAM_FIXER_VERIFY_SSL,
+        ) as client:
+            r = client.get(f"https://{host}{path}", headers=YDL_HTTP_HEADERS)
+    except Exception as e:
+        return (False, _health_exc_reason(e))
+    if r.status_code != 200:
+        return (False, f"http {r.status_code}")
+    items = _extract_og_media_items(r.text)
+    if not items:
+        return (False, "sin media en OG")
+    return (True, f"ok ({len(items)} medios)")
+
+
+def _health_probe_instapdown(canary: str) -> tuple:
+    if not INSTAGRAM_INSTAPDOWN_API_URL:
+        return (False, "deshabilitado")
+    try:
+        with httpx.Client(timeout=INSTAGRAM_PROBE_TIMEOUT) as client:
+            r = client.post(
+                INSTAGRAM_INSTAPDOWN_API_URL,
+                headers={
+                    "User-Agent": BROWSER_HEADERS["User-Agent"],
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
+                json={"url": canary, "variant": "photo"},
+            )
+            if r.status_code != 200:
+                return (False, f"http {r.status_code}")
+            payload = r.json()
+    except Exception as e:
+        return (False, _health_exc_reason(e))
+    if not payload.get("ok") or not payload.get("items"):
+        return (False, "sin media")
+    return (True, f"ok ({len(payload['items'])} medios)")
+
+
+def _health_probe_downreels(canary: str) -> tuple:
+    if not INSTAGRAM_DOWNREELS_API_URL:
+        return (False, "deshabilitado")
+    try:
+        with httpx.Client(timeout=INSTAGRAM_PROBE_TIMEOUT) as client:
+            r = client.post(
+                INSTAGRAM_DOWNREELS_API_URL,
+                headers={
+                    "User-Agent": BROWSER_HEADERS["User-Agent"],
+                    "Content-Type": "application/json",
+                    "Referer": "https://downreels.com/",
+                },
+                json={"url": canary},
+            )
+            if r.status_code != 200:
+                return (False, f"http {r.status_code}")
+            r.json()
+    except Exception as e:
+        return (False, _health_exc_reason(e))
+    return (True, "ok")
+
+
+def _health_probe_fastvidl(canary: str) -> tuple:
+    if not INSTAGRAM_FASTVIDL_API_URL:
+        return (False, "deshabilitado")
+    try:
+        with httpx.Client(timeout=INSTAGRAM_PROBE_TIMEOUT) as client:
+            r = client.post(
+                INSTAGRAM_FASTVIDL_API_URL,
+                headers={
+                    "User-Agent": BROWSER_HEADERS["User-Agent"],
+                    "Content-Type": "application/json",
+                    "Referer": "https://fastvidl.com/instagram-video-downloader-free",
+                },
+                json={"url": canary},
+            )
+            if r.status_code != 200:
+                return (False, f"http {r.status_code}")
+            r.json()
+    except Exception as e:
+        return (False, _health_exc_reason(e))
+    return (True, "ok")
+
+
+def _health_probe_nuelink(canary: str) -> tuple:
+    if not INSTAGRAM_NUELINK_API_URL:
+        return (False, "deshabilitado")
+    try:
+        with httpx.Client(timeout=INSTAGRAM_PROBE_TIMEOUT) as client:
+            r = client.get(
+                INSTAGRAM_NUELINK_API_URL,
+                params={"link": canary},
+                headers={
+                    "User-Agent": BROWSER_HEADERS["User-Agent"],
+                    "Referer": "https://nuelink.com/tools/instagram-video-downloader",
+                },
+            )
+            if r.status_code != 200:
+                return (False, f"http {r.status_code}")
+            r.json()
+    except Exception as e:
+        return (False, _health_exc_reason(e))
+    return (True, "ok")
+
+
+def _health_probe_listnr(canary: str) -> tuple:
+    if not INSTAGRAM_LISTNR_API_URL:
+        return (False, "deshabilitado")
+    try:
+        with httpx.Client(timeout=INSTAGRAM_PROBE_TIMEOUT) as client:
+            r = client.post(
+                INSTAGRAM_LISTNR_API_URL,
+                headers={
+                    "User-Agent": BROWSER_HEADERS["User-Agent"],
+                    "Content-Type": "application/json",
+                    "Referer": "https://listnr.ai/instagram-video-downloader",
+                    "Origin": "https://listnr.ai",
+                },
+                json={"url": canary, "platform": "instagram", "type": "video"},
+            )
+            if r.status_code != 200:
+                return (False, f"http {r.status_code}")
+            r.json()
+    except Exception as e:
+        return (False, _health_exc_reason(e))
+    return (True, "ok")
+
+
+def instagram_run_health_check() -> dict:
+    """Sondea todos los métodos contra el post canario y persiste el estado del día."""
+    canary = INSTAGRAM_HEALTH_CANARY_URL
+    probes = {
+        "direct": lambda: _health_probe_direct(_ig_shortcode_from_url(canary)),
+        "instapdown": lambda: _health_probe_instapdown(canary),
+        "downreels": lambda: _health_probe_downreels(canary),
+        "fastvidl": lambda: _health_probe_fastvidl(canary),
+        "nuelink": lambda: _health_probe_nuelink(canary),
+        "listnr": lambda: _health_probe_listnr(canary),
+    }
+    for host in INSTAGRAM_FIXER_HOSTS:
+        probes[f"fixer:{host}"] = lambda host=host: _health_probe_fixer(host, canary)
+
+    methods = {}
+    for name, probe in probes.items():
+        try:
+            alive, reason = probe()
+        except Exception as e:
+            alive, reason = False, _health_exc_reason(e)
+        methods[name] = {
+            "alive": bool(alive),
+            "reason": str(reason)[:100],
+            "at": datetime.now(BA_TZ).isoformat(timespec="seconds"),
+        }
+
+    state = {
+        "date": _health_today(),
+        "checked_at": datetime.now(BA_TZ).isoformat(timespec="seconds"),
+        "canary_url": canary,
+        "probe_timeout_s": INSTAGRAM_PROBE_TIMEOUT,
+        "methods": methods,
+    }
+    with _HEALTH_LOCK:
+        _save_health_state_locked(state)
+
+    summary = ", ".join(
+        f"{name}={'vivo' if rec['alive'] else 'MUERTO'}" for name, rec in methods.items()
+    )
+    logger.info("Instagram health check: %s", summary)
+    return state
 
 
 def is_instagram(url: str) -> bool:
@@ -487,9 +822,13 @@ def _ig_download_via_downreels(url: str, on_item=None, trace: _RouteTrace = None
     """Use downreels.com's JSON API, which resolves direct fbcdn media URLs."""
     if not INSTAGRAM_DOWNREELS_API_URL:
         return []
+    if not method_alive("downreels"):
+        if trace:
+            trace.add("downreels", "salteado (muerto hoy)")
+        return []
 
     try:
-        with httpx.Client(timeout=30) as client:
+        with httpx.Client(timeout=INSTAGRAM_PROBE_TIMEOUT) as client:
             r = client.post(
                 INSTAGRAM_DOWNREELS_API_URL,
                 headers={
@@ -501,12 +840,15 @@ def _ig_download_via_downreels(url: str, on_item=None, trace: _RouteTrace = None
             )
             if r.status_code != 200:
                 logger.debug("downreels HTTP %s", r.status_code)
+                if r.status_code >= 500:
+                    _mark_method_dead("downreels", f"http {r.status_code}")
                 if trace:
                     trace.add("downreels", f"http {r.status_code}")
                 return []
             payload = r.json()
     except Exception as e:
         logger.debug("downreels request failed: %s", e)
+        _mark_method_dead("downreels", _health_exc_reason(e))
         if trace:
             trace.add("downreels", "error")
         return []
@@ -543,9 +885,13 @@ def _ig_download_via_fastvidl(url: str, on_item=None, trace: _RouteTrace = None)
     """Use fastvidl.com's JSON API, which resolves direct CDN media URLs."""
     if not INSTAGRAM_FASTVIDL_API_URL:
         return []
+    if not method_alive("fastvidl"):
+        if trace:
+            trace.add("fastvidl", "salteado (muerto hoy)")
+        return []
 
     try:
-        with httpx.Client(timeout=30) as client:
+        with httpx.Client(timeout=INSTAGRAM_PROBE_TIMEOUT) as client:
             r = client.post(
                 INSTAGRAM_FASTVIDL_API_URL,
                 headers={
@@ -557,12 +903,15 @@ def _ig_download_via_fastvidl(url: str, on_item=None, trace: _RouteTrace = None)
             )
             if r.status_code != 200:
                 logger.debug("fastvidl HTTP %s", r.status_code)
+                if r.status_code >= 500:
+                    _mark_method_dead("fastvidl", f"http {r.status_code}")
                 if trace:
                     trace.add("fastvidl", f"http {r.status_code}")
                 return []
             payload = r.json()
     except Exception as e:
         logger.debug("fastvidl request failed: %s", e)
+        _mark_method_dead("fastvidl", _health_exc_reason(e))
         if trace:
             trace.add("fastvidl", "error")
         return []
@@ -599,9 +948,13 @@ def _ig_download_via_nuelink(url: str, on_item=None, trace: _RouteTrace = None) 
     """Use nuelink.com's API, which mirrors the media to its own storage."""
     if not INSTAGRAM_NUELINK_API_URL:
         return []
+    if not method_alive("nuelink"):
+        if trace:
+            trace.add("nuelink", "salteado (muerto hoy)")
+        return []
 
     try:
-        with httpx.Client(timeout=30) as client:
+        with httpx.Client(timeout=INSTAGRAM_PROBE_TIMEOUT) as client:
             r = client.get(
                 INSTAGRAM_NUELINK_API_URL,
                 params={"link": url},
@@ -612,12 +965,15 @@ def _ig_download_via_nuelink(url: str, on_item=None, trace: _RouteTrace = None) 
             )
             if r.status_code != 200:
                 logger.debug("nuelink HTTP %s", r.status_code)
+                if r.status_code >= 500:
+                    _mark_method_dead("nuelink", f"http {r.status_code}")
                 if trace:
                     trace.add("nuelink", f"http {r.status_code}")
                 return []
             payload = r.json()
     except Exception as e:
         logger.debug("nuelink request failed: %s", e)
+        _mark_method_dead("nuelink", _health_exc_reason(e))
         if trace:
             trace.add("nuelink", "error")
         return []
@@ -647,9 +1003,13 @@ def _ig_download_via_listnr(url: str, on_item=None, trace: _RouteTrace = None) -
     """Use listnr.ai's API, which proxies media via a signed JWT link."""
     if not INSTAGRAM_LISTNR_API_URL:
         return []
+    if not method_alive("listnr"):
+        if trace:
+            trace.add("listnr", "salteado (muerto hoy)")
+        return []
 
     try:
-        with httpx.Client(timeout=30) as client:
+        with httpx.Client(timeout=INSTAGRAM_PROBE_TIMEOUT) as client:
             r = client.post(
                 INSTAGRAM_LISTNR_API_URL,
                 headers={
@@ -662,12 +1022,15 @@ def _ig_download_via_listnr(url: str, on_item=None, trace: _RouteTrace = None) -
             )
             if r.status_code != 200:
                 logger.debug("listnr HTTP %s", r.status_code)
+                if r.status_code >= 500:
+                    _mark_method_dead("listnr", f"http {r.status_code}")
                 if trace:
                     trace.add("listnr", f"http {r.status_code}")
                 return []
             payload = r.json()
     except Exception as e:
         logger.debug("listnr request failed: %s", e)
+        _mark_method_dead("listnr", _health_exc_reason(e))
         if trace:
             trace.add("listnr", "error")
         return []
@@ -692,19 +1055,89 @@ def _ig_download_via_listnr(url: str, on_item=None, trace: _RouteTrace = None) -
     return results
 
 
-def _ig_collect_fixer_items(client: httpx.Client, host: str, url: str) -> list:
+def _ig_download_via_instapdown(url: str, on_item=None, trace: _RouteTrace = None) -> list:
+    """Use instapdown.com's JSON API, which returns direct CDN media URLs."""
+    if not INSTAGRAM_INSTAPDOWN_API_URL:
+        return []
+    if not method_alive("instapdown"):
+        if trace:
+            trace.add("instapdown", "salteado (muerto hoy)")
+        return []
+
+    if _ig_story_path_from_url(url):
+        variant = "story"
+    elif re.search(r"/(?:reel|reels|tv)/", url):
+        variant = "reels"
+    else:
+        variant = "carousel"
+
+    try:
+        with httpx.Client(timeout=INSTAGRAM_PROBE_TIMEOUT) as client:
+            r = client.post(
+                INSTAGRAM_INSTAPDOWN_API_URL,
+                headers={
+                    "User-Agent": BROWSER_HEADERS["User-Agent"],
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
+                json={"url": url, "variant": variant},
+            )
+            if r.status_code != 200:
+                logger.debug("instapdown HTTP %s", r.status_code)
+                if r.status_code >= 500:
+                    _mark_method_dead("instapdown", f"http {r.status_code}")
+                if trace:
+                    trace.add("instapdown", f"http {r.status_code}")
+                return []
+            payload = r.json()
+    except Exception as e:
+        logger.debug("instapdown request failed: %s", e)
+        _mark_method_dead("instapdown", _health_exc_reason(e))
+        if trace:
+            trace.add("instapdown", "error")
+        return []
+
+    entries = payload.get("items")
+    if not payload.get("ok") or not entries:
+        if trace:
+            trace.add("instapdown", "sin media")
+        return []
+
+    results = []
+    seen = set()
+    seen_hashes = set()
+    for entry in entries:
+        media_url = entry.get("url")
+        if not media_url or media_url in seen:
+            continue
+        seen.add(media_url)
+        item_type = "video" if entry.get("kind") == "video" else "image"
+        downloaded = _download_cdn_url(media_url, item_type, headers=BROWSER_HEADERS)
+        if downloaded:
+            _emit_downloaded_item(downloaded, results, on_item, seen_hashes=seen_hashes)
+
+    if results:
+        logger.info("Instagram media downloaded via instapdown")
+        if trace:
+            trace.add("instapdown", "ok")
+    elif trace:
+        trace.add("instapdown", "cdn sin descargas")
+    return results
+
+
+def _ig_collect_fixer_items(client: httpx.Client, host: str, url: str) -> tuple:
     path = _ig_path_from_url(url)
     if not path or not INSTAGRAM_FIXER_HOSTS:
-        return []
+        return ([], None)
 
     fixer_parts = urlsplit(url)
     fixer_url = urlunsplit(("https", host, path, fixer_parts.query, ""))
     r = client.get(fixer_url, headers=YDL_HTTP_HEADERS)
     if r.status_code != 200:
         logger.debug(f"Instagram fixer {host} returned HTTP {r.status_code}")
-        return []
+        return ([], r.status_code)
 
-    return _extract_og_media_items(r.text)
+    return (_extract_og_media_items(r.text), r.status_code)
 
 
 def _ig_download_via_fixers(url: str, source_url: str = None, on_item=None, trace: _RouteTrace = None) -> list:
@@ -720,6 +1153,10 @@ def _ig_download_via_fixers(url: str, source_url: str = None, on_item=None, trac
 
     host_outcomes = []
     for host in INSTAGRAM_FIXER_HOSTS:
+        if not method_alive(f"fixer:{host}"):
+            host_outcomes.append(f"{host}=muerto hoy")
+            continue
+
         results = []
         items = []
         seen = set()
@@ -729,16 +1166,20 @@ def _ig_download_via_fixers(url: str, source_url: str = None, on_item=None, trac
         try:
             with httpx.Client(
                 follow_redirects=True,
-                timeout=30,
+                timeout=INSTAGRAM_PROBE_TIMEOUT,
                 verify=INSTAGRAM_FIXER_VERIFY_SSL,
             ) as client:
-                base_items = _ig_collect_fixer_items(client, host, url)
+                base_items, base_status = _ig_collect_fixer_items(client, host, url)
+                if base_status and base_status >= 500 and not base_items:
+                    _mark_method_dead(f"fixer:{host}", f"http {base_status}")
+                    host_outcomes.append(f"{host}=http {base_status} (muerto hoy)")
+                    continue
                 _append_unique_media_items(items, base_items, seen)
 
                 if should_probe_carousel:
                     for index in range(1, INSTAGRAM_MAX_CAROUSEL_ITEMS + 1):
                         indexed_url = _ig_url_with_img_index(url, index)
-                        indexed_items = _ig_collect_fixer_items(
+                        indexed_items, _ = _ig_collect_fixer_items(
                             client, host, indexed_url
                         )
                         added = _append_unique_media_items(
@@ -750,7 +1191,8 @@ def _ig_download_via_fixers(url: str, source_url: str = None, on_item=None, trac
                                 break
         except Exception as e:
             logger.debug(f"Instagram fixer {host} request failed: {e}")
-            host_outcomes.append(f"{host}=error")
+            _mark_method_dead(f"fixer:{host}", _health_exc_reason(e))
+            host_outcomes.append(f"{host}=error (muerto hoy)")
             continue
 
         if not items:
@@ -837,13 +1279,8 @@ def _ig_download_via_fixers(url: str, source_url: str = None, on_item=None, trac
     return []
 
 
-def _ig_download_direct(url: str, on_item=None, trace: _RouteTrace = None) -> list:
-    """Use anonymous Instaloader access for public Instagram posts."""
-    shortcode = _ig_shortcode_from_url(url)
-    if not shortcode:
-        raise DownloadError("Link de Instagram inválido.")
-
-    L = instaloader.Instaloader(
+def _new_instaloader() -> "instaloader.Instaloader":
+    return instaloader.Instaloader(
         download_pictures=False,
         download_videos=False,
         download_video_thumbnails=False,
@@ -854,12 +1291,22 @@ def _ig_download_direct(url: str, on_item=None, trace: _RouteTrace = None) -> li
         max_connection_attempts=1,
     )
 
+
+def _ig_download_direct(url: str, on_item=None, trace: _RouteTrace = None) -> list:
+    """Use anonymous Instaloader access for public Instagram posts."""
+    shortcode = _ig_shortcode_from_url(url)
+    if not shortcode:
+        raise DownloadError("Link de Instagram inválido.")
+
+    L = _new_instaloader()
+
     try:
         post = instaloader.Post.from_shortcode(L.context, shortcode)
     except Exception as e:
         message = str(e)
         if _is_instagram_auth_or_rate_limit_error(message):
             _trip_instagram_circuit(message)
+            _mark_method_dead("direct", "bloqueo auth")
             if trace:
                 trace.add("direct", "bloqueo auth (graphql)")
             raise DownloadError(
@@ -906,6 +1353,7 @@ def _ig_download_direct(url: str, on_item=None, trace: _RouteTrace = None) -> li
             )
         elif status_code in (401, 403, 429):
             _trip_instagram_circuit(f"cdn http {status_code}")
+            _mark_method_dead("direct", f"cdn http {status_code}")
             if trace:
                 trace.add("direct", f"cdn {status_code}")
             raise DownloadError(
@@ -932,6 +1380,9 @@ def _ig_download(url: str, source_url: str = None, on_item=None, trace: _RouteTr
         saveinsta_results = _ig_download_story_via_saveinsta(url, on_item=on_item)
         if saveinsta_results:
             return saveinsta_results
+        instapdown_results = _ig_download_via_instapdown(url, on_item=on_item, trace=trace)
+        if instapdown_results:
+            return instapdown_results
         downreels_results = _ig_download_via_downreels(url, on_item=on_item, trace=trace)
         if downreels_results:
             return downreels_results
@@ -946,32 +1397,47 @@ def _ig_download(url: str, source_url: str = None, on_item=None, trace: _RouteTr
             return listnr_results
         if trace:
             trace.add("story", "no disponible")
+        instagram_note_total_failure()
         raise DownloadError(
             "No pude obtener esa historia de Instagram con los métodos alternativos. "
             "Puede haber vencido, ser privada o no estar disponible públicamente."
         )
 
-    try:
-        return _ig_download_direct(url, on_item=on_item, trace=trace)
-    except DownloadError as direct_error:
-        fixer_results = _ig_download_via_fixers(
-            url, source_url=source_url, on_item=on_item, trace=trace
-        )
-        if fixer_results:
-            return fixer_results
-        downreels_results = _ig_download_via_downreels(url, on_item=on_item, trace=trace)
-        if downreels_results:
-            return downreels_results
-        fastvidl_results = _ig_download_via_fastvidl(url, on_item=on_item, trace=trace)
-        if fastvidl_results:
-            return fastvidl_results
-        nuelink_results = _ig_download_via_nuelink(url, on_item=on_item, trace=trace)
-        if nuelink_results:
-            return nuelink_results
-        listnr_results = _ig_download_via_listnr(url, on_item=on_item, trace=trace)
-        if listnr_results:
-            return listnr_results
+    direct_error = None
+    if method_alive("direct"):
+        try:
+            return _ig_download_direct(url, on_item=on_item, trace=trace)
+        except DownloadError as e:
+            direct_error = e
+    elif trace:
+        trace.add("direct", "salteado (muerto hoy)")
+
+    fixer_results = _ig_download_via_fixers(
+        url, source_url=source_url, on_item=on_item, trace=trace
+    )
+    if fixer_results:
+        return fixer_results
+    instapdown_results = _ig_download_via_instapdown(url, on_item=on_item, trace=trace)
+    if instapdown_results:
+        return instapdown_results
+    downreels_results = _ig_download_via_downreels(url, on_item=on_item, trace=trace)
+    if downreels_results:
+        return downreels_results
+    fastvidl_results = _ig_download_via_fastvidl(url, on_item=on_item, trace=trace)
+    if fastvidl_results:
+        return fastvidl_results
+    nuelink_results = _ig_download_via_nuelink(url, on_item=on_item, trace=trace)
+    if nuelink_results:
+        return nuelink_results
+    listnr_results = _ig_download_via_listnr(url, on_item=on_item, trace=trace)
+    if listnr_results:
+        return listnr_results
+    instagram_note_total_failure()
+    if direct_error:
         raise direct_error
+    raise DownloadError(
+        "No pude obtener el contenido de Instagram por ningún método disponible hoy."
+    )
 
 
 def _download_cdn_url(cdn_url: str, item_type: str, headers: dict = None, return_status: bool = False):
