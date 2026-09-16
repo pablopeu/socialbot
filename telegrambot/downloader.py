@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -296,41 +297,46 @@ def instagram_seconds_until_next_check() -> float:
 
 def _health_probe_direct(shortcode: str) -> tuple:
     if not shortcode:
-        return (False, "canario inválido")
+        return (False, "canario inválido", None)
     try:
         L = _new_instaloader()
+        started = time.monotonic()
         post = instaloader.Post.from_shortcode(L.context, shortcode)
+        latency_ms = int((time.monotonic() - started) * 1000)
     except Exception as e:
-        return (False, _health_exc_reason(e))
-    return (True, f"ok ({post.typename})")
+        return (False, _health_exc_reason(e), None)
+    return (True, f"ok ({post.typename})", latency_ms)
 
 
 def _health_probe_fixer(host: str, canary: str) -> tuple:
     path = _ig_path_from_url(canary)
     if not path:
-        return (False, "canario inválido")
+        return (False, "canario inválido", None)
     try:
         with httpx.Client(
             follow_redirects=True,
             timeout=INSTAGRAM_PROBE_TIMEOUT,
             verify=INSTAGRAM_FIXER_VERIFY_SSL,
         ) as client:
+            started = time.monotonic()
             r = client.get(f"https://{host}{path}", headers=YDL_HTTP_HEADERS)
+            latency_ms = int((time.monotonic() - started) * 1000)
     except Exception as e:
-        return (False, _health_exc_reason(e))
+        return (False, _health_exc_reason(e), None)
     if r.status_code != 200:
-        return (False, f"http {r.status_code}")
+        return (False, f"http {r.status_code}", None)
     items = _extract_og_media_items(r.text)
     if not items:
-        return (False, "sin media en OG")
-    return (True, f"ok ({len(items)} medios)")
+        return (False, "sin media en OG", None)
+    return (True, f"ok ({len(items)} medios)", latency_ms)
 
 
 def _health_probe_instapdown(canary: str) -> tuple:
     if not INSTAGRAM_INSTAPDOWN_API_URL:
-        return (False, "deshabilitado")
+        return (False, "deshabilitado", None)
     try:
         with httpx.Client(timeout=INSTAGRAM_PROBE_TIMEOUT) as client:
+            started = time.monotonic()
             r = client.post(
                 INSTAGRAM_INSTAPDOWN_API_URL,
                 headers={
@@ -341,20 +347,22 @@ def _health_probe_instapdown(canary: str) -> tuple:
                 json={"url": canary, "variant": "photo"},
             )
             if r.status_code != 200:
-                return (False, f"http {r.status_code}")
+                return (False, f"http {r.status_code}", None)
             payload = r.json()
+            latency_ms = int((time.monotonic() - started) * 1000)
     except Exception as e:
-        return (False, _health_exc_reason(e))
+        return (False, _health_exc_reason(e), None)
     if not payload.get("ok") or not payload.get("items"):
-        return (False, "sin media")
-    return (True, f"ok ({len(payload['items'])} medios)")
+        return (False, "sin media", None)
+    return (True, f"ok ({len(payload['items'])} medios)", latency_ms)
 
 
 def _health_probe_downreels(canary: str) -> tuple:
     if not INSTAGRAM_DOWNREELS_API_URL:
-        return (False, "deshabilitado")
+        return (False, "deshabilitado", None)
     try:
         with httpx.Client(timeout=INSTAGRAM_PROBE_TIMEOUT) as client:
+            started = time.monotonic()
             r = client.post(
                 INSTAGRAM_DOWNREELS_API_URL,
                 headers={
@@ -365,18 +373,20 @@ def _health_probe_downreels(canary: str) -> tuple:
                 json={"url": canary},
             )
             if r.status_code != 200:
-                return (False, f"http {r.status_code}")
+                return (False, f"http {r.status_code}", None)
             r.json()
+            latency_ms = int((time.monotonic() - started) * 1000)
     except Exception as e:
-        return (False, _health_exc_reason(e))
-    return (True, "ok")
+        return (False, _health_exc_reason(e), None)
+    return (True, "ok", latency_ms)
 
 
 def _health_probe_fastvidl(canary: str) -> tuple:
     if not INSTAGRAM_FASTVIDL_API_URL:
-        return (False, "deshabilitado")
+        return (False, "deshabilitado", None)
     try:
         with httpx.Client(timeout=INSTAGRAM_PROBE_TIMEOUT) as client:
+            started = time.monotonic()
             r = client.post(
                 INSTAGRAM_FASTVIDL_API_URL,
                 headers={
@@ -387,18 +397,20 @@ def _health_probe_fastvidl(canary: str) -> tuple:
                 json={"url": canary},
             )
             if r.status_code != 200:
-                return (False, f"http {r.status_code}")
+                return (False, f"http {r.status_code}", None)
             r.json()
+            latency_ms = int((time.monotonic() - started) * 1000)
     except Exception as e:
-        return (False, _health_exc_reason(e))
-    return (True, "ok")
+        return (False, _health_exc_reason(e), None)
+    return (True, "ok", latency_ms)
 
 
 def _health_probe_nuelink(canary: str) -> tuple:
     if not INSTAGRAM_NUELINK_API_URL:
-        return (False, "deshabilitado")
+        return (False, "deshabilitado", None)
     try:
         with httpx.Client(timeout=INSTAGRAM_PROBE_TIMEOUT) as client:
+            started = time.monotonic()
             r = client.get(
                 INSTAGRAM_NUELINK_API_URL,
                 params={"link": canary},
@@ -408,18 +420,20 @@ def _health_probe_nuelink(canary: str) -> tuple:
                 },
             )
             if r.status_code != 200:
-                return (False, f"http {r.status_code}")
+                return (False, f"http {r.status_code}", None)
             r.json()
+            latency_ms = int((time.monotonic() - started) * 1000)
     except Exception as e:
-        return (False, _health_exc_reason(e))
-    return (True, "ok")
+        return (False, _health_exc_reason(e), None)
+    return (True, "ok", latency_ms)
 
 
 def _health_probe_listnr(canary: str) -> tuple:
     if not INSTAGRAM_LISTNR_API_URL:
-        return (False, "deshabilitado")
+        return (False, "deshabilitado", None)
     try:
         with httpx.Client(timeout=INSTAGRAM_PROBE_TIMEOUT) as client:
+            started = time.monotonic()
             r = client.post(
                 INSTAGRAM_LISTNR_API_URL,
                 headers={
@@ -431,11 +445,12 @@ def _health_probe_listnr(canary: str) -> tuple:
                 json={"url": canary, "platform": "instagram", "type": "video"},
             )
             if r.status_code != 200:
-                return (False, f"http {r.status_code}")
+                return (False, f"http {r.status_code}", None)
             r.json()
+            latency_ms = int((time.monotonic() - started) * 1000)
     except Exception as e:
-        return (False, _health_exc_reason(e))
-    return (True, "ok")
+        return (False, _health_exc_reason(e), None)
+    return (True, "ok", latency_ms)
 
 
 def instagram_run_health_check() -> dict:
@@ -455,14 +470,17 @@ def instagram_run_health_check() -> dict:
     methods = {}
     for name, probe in probes.items():
         try:
-            alive, reason = probe()
+            alive, reason, latency_ms = probe()
         except Exception as e:
-            alive, reason = False, _health_exc_reason(e)
-        methods[name] = {
+            alive, reason, latency_ms = False, _health_exc_reason(e), None
+        record = {
             "alive": bool(alive),
             "reason": str(reason)[:100],
             "at": datetime.now(BA_TZ).isoformat(timespec="seconds"),
         }
+        if alive and isinstance(latency_ms, (int, float)):
+            record["latency_ms"] = int(latency_ms)
+        methods[name] = record
 
     state = {
         "date": _health_today(),
@@ -474,11 +492,80 @@ def instagram_run_health_check() -> dict:
     with _HEALTH_LOCK:
         _save_health_state_locked(state)
 
-    summary = ", ".join(
-        f"{name}={'vivo' if rec['alive'] else 'MUERTO'}" for name, rec in methods.items()
-    )
-    logger.info("Instagram health check: %s", summary)
+    parts = []
+    for name, rec in methods.items():
+        if rec["alive"] and isinstance(rec.get("latency_ms"), int):
+            parts.append(f"{name}=vivo ({rec['latency_ms']} ms)")
+        else:
+            parts.append(f"{name}={'vivo' if rec['alive'] else 'MUERTO'}")
+    logger.info("Instagram health check: %s", ", ".join(parts))
     return state
+
+
+_DEFAULT_API_ORDER = ("instapdown", "downreels", "fastvidl", "nuelink", "listnr")
+
+
+def instagram_ranked_stages() -> list:
+    """Etapas de terceros ordenadas por la latencia medida en el chequeo de hoy.
+
+    La etapa 'fixers' se ubica según su fixer vivo más rápido (dentro de la
+    etapa los hosts se ordenan con `_ranked_fixer_hosts`). Los vivos sin
+    latencia medida van después, y los muertos al final (igual se saltean).
+    Sin datos de hoy devuelve el orden por defecto.
+    """
+    stages = ["fixers", *_DEFAULT_API_ORDER]
+    state = _load_health_state()
+    if state.get("date") != _health_today():
+        return list(stages)
+    methods = state.get("methods", {})
+    default_idx = {name: i for i, name in enumerate(stages)}
+
+    def fixer_records() -> list:
+        return [
+            r for n, r in methods.items()
+            if isinstance(r, dict) and n.startswith("fixer:")
+        ]
+
+    def stage_key(name: str):
+        if name == "fixers":
+            lats = [
+                r["latency_ms"] for r in fixer_records()
+                if r.get("alive") and isinstance(r.get("latency_ms"), int)
+            ]
+            if lats:
+                return (0, float(min(lats)), default_idx[name])
+            if any(r.get("alive") for r in fixer_records()):
+                return (1, 0.0, default_idx[name])
+            return (2, 0.0, default_idx[name])
+        record = methods.get(name)
+        if isinstance(record, dict) and record.get("alive"):
+            latency = record.get("latency_ms")
+            if isinstance(latency, int):
+                return (0, float(latency), default_idx[name])
+            return (1, 0.0, default_idx[name])
+        return (2, 0.0, default_idx[name])
+
+    return sorted(stages, key=stage_key)
+
+
+def _ranked_fixer_hosts() -> list:
+    hosts = list(INSTAGRAM_FIXER_HOSTS)
+    state = _load_health_state()
+    if state.get("date") != _health_today():
+        return hosts
+    methods = state.get("methods", {})
+    default_idx = {host: i for i, host in enumerate(hosts)}
+
+    def host_key(host: str):
+        record = methods.get(f"fixer:{host}")
+        if isinstance(record, dict) and record.get("alive"):
+            latency = record.get("latency_ms")
+            if isinstance(latency, int):
+                return (0, float(latency), default_idx[host])
+            return (1, 0.0, default_idx[host])
+        return (2, 0.0, default_idx[host])
+
+    return sorted(hosts, key=host_key)
 
 
 def is_instagram(url: str) -> bool:
@@ -1152,7 +1239,7 @@ def _ig_download_via_fixers(url: str, source_url: str = None, on_item=None, trac
     should_probe_carousel = is_post and not prefer_video
 
     host_outcomes = []
-    for host in INSTAGRAM_FIXER_HOSTS:
+    for host in _ranked_fixer_hosts():
         if not method_alive(f"fixer:{host}"):
             host_outcomes.append(f"{host}=muerto hoy")
             continue
@@ -1371,6 +1458,14 @@ def _ig_download_direct(url: str, on_item=None, trace: _RouteTrace = None) -> li
 
 def _ig_download(url: str, source_url: str = None, on_item=None, trace: _RouteTrace = None) -> list:
     source_url = source_url or url
+    api_runners = {
+        "instapdown": lambda: _ig_download_via_instapdown(url, on_item=on_item, trace=trace),
+        "downreels": lambda: _ig_download_via_downreels(url, on_item=on_item, trace=trace),
+        "fastvidl": lambda: _ig_download_via_fastvidl(url, on_item=on_item, trace=trace),
+        "nuelink": lambda: _ig_download_via_nuelink(url, on_item=on_item, trace=trace),
+        "listnr": lambda: _ig_download_via_listnr(url, on_item=on_item, trace=trace),
+    }
+
     if _ig_story_path_from_url(url):
         fixer_results = _ig_download_via_fixers(
             url, source_url=source_url, on_item=on_item, trace=trace
@@ -1380,21 +1475,13 @@ def _ig_download(url: str, source_url: str = None, on_item=None, trace: _RouteTr
         saveinsta_results = _ig_download_story_via_saveinsta(url, on_item=on_item)
         if saveinsta_results:
             return saveinsta_results
-        instapdown_results = _ig_download_via_instapdown(url, on_item=on_item, trace=trace)
-        if instapdown_results:
-            return instapdown_results
-        downreels_results = _ig_download_via_downreels(url, on_item=on_item, trace=trace)
-        if downreels_results:
-            return downreels_results
-        fastvidl_results = _ig_download_via_fastvidl(url, on_item=on_item, trace=trace)
-        if fastvidl_results:
-            return fastvidl_results
-        nuelink_results = _ig_download_via_nuelink(url, on_item=on_item, trace=trace)
-        if nuelink_results:
-            return nuelink_results
-        listnr_results = _ig_download_via_listnr(url, on_item=on_item, trace=trace)
-        if listnr_results:
-            return listnr_results
+        for stage in instagram_ranked_stages():
+            runner = api_runners.get(stage)
+            if runner is None:
+                continue
+            results = runner()
+            if results:
+                return results
         if trace:
             trace.add("story", "no disponible")
         instagram_note_total_failure()
@@ -1412,26 +1499,16 @@ def _ig_download(url: str, source_url: str = None, on_item=None, trace: _RouteTr
     elif trace:
         trace.add("direct", "salteado (muerto hoy)")
 
-    fixer_results = _ig_download_via_fixers(
-        url, source_url=source_url, on_item=on_item, trace=trace
-    )
-    if fixer_results:
-        return fixer_results
-    instapdown_results = _ig_download_via_instapdown(url, on_item=on_item, trace=trace)
-    if instapdown_results:
-        return instapdown_results
-    downreels_results = _ig_download_via_downreels(url, on_item=on_item, trace=trace)
-    if downreels_results:
-        return downreels_results
-    fastvidl_results = _ig_download_via_fastvidl(url, on_item=on_item, trace=trace)
-    if fastvidl_results:
-        return fastvidl_results
-    nuelink_results = _ig_download_via_nuelink(url, on_item=on_item, trace=trace)
-    if nuelink_results:
-        return nuelink_results
-    listnr_results = _ig_download_via_listnr(url, on_item=on_item, trace=trace)
-    if listnr_results:
-        return listnr_results
+    runners = {
+        "fixers": lambda: _ig_download_via_fixers(
+            url, source_url=source_url, on_item=on_item, trace=trace
+        ),
+        **api_runners,
+    }
+    for stage in instagram_ranked_stages():
+        results = runners[stage]()
+        if results:
+            return results
     instagram_note_total_failure()
     if direct_error:
         raise direct_error

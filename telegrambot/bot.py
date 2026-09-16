@@ -566,7 +566,9 @@ async def cmd_instagram_status(update: Update, context: ContextTypes.DEFAULT_TYP
         for name in sorted(health.get("methods", {})):
             record = health["methods"][name]
             state_txt = "vivo" if record.get("alive") else "MUERTO"
-            lines.append(f"  {name}: {state_txt} — {record.get('reason', '')}")
+            latency = record.get("latency_ms")
+            latency_txt = f" ({latency} ms)" if record.get("alive") and isinstance(latency, int) else ""
+            lines.append(f"  {name}: {state_txt}{latency_txt} — {record.get('reason', '')}")
     else:
         lines.append("Chequeo de salud: sin datos (corre al iniciar o a la madrugada)")
     if alert_state.get("active_failure_key"):
