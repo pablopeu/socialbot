@@ -61,7 +61,11 @@ INSTAGRAM_FIXER_HOSTS = tuple(
     host.strip()
     for host in os.getenv(
         "SOCIALBOT_INSTAGRAM_FIXER_HOSTS",
-        "vxinstagram.com,zzinstagram.com,fxstagram.com,eeinstagram.com",
+        # Verificados desde el VPS (og real en post y reel) primero;
+        # el health check diario rankea por latencia y saltea los muertos.
+        "zzinstagram.com,instagram7.com,toinstagram.com,uuinstagram.com,"
+        "vxinstagram.com,fxstagram.com,eeinstagram.com,"
+        "dtoinstagram.com,ddinstagram.com,instagramez.com,kkinstagram.com,oginstagram.com",
     ).split(",")
     if host.strip()
 )
