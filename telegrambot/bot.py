@@ -58,6 +58,35 @@ def _probe_duration(path: str) -> float:
     return float(result.stdout.strip())
 
 
+def _probe_video_meta(path: str) -> Optional[dict]:
+    """Width/height/duration del stream de video, o None si no se puede leer.
+
+    Telegram renderiza el reproductor según los width/height del mensaje;
+    sin ellos iOS muestra el video con el aspect ratio equivocado.
+    """
+    if not FFPROBE_BIN:
+        return None
+    try:
+        result = subprocess.run(
+            [FFPROBE_BIN, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height:format=duration",
+             "-of", "json", path],
+            capture_output=True, text=True, timeout=60,
+        )
+        meta = json.loads(result.stdout)
+        stream = next(iter(meta.get("streams") or []), None)
+        width, height = (stream or {}).get("width"), (stream or {}).get("height")
+        if not width or not height:
+            return None
+        out = {"width": int(width), "height": int(height)}
+        duration = (meta.get("format") or {}).get("duration")
+        if duration and float(duration) > 0:
+            out["duration"] = int(float(duration))
+        return out
+    except (subprocess.TimeoutExpired, ValueError, KeyError, json.JSONDecodeError):
+        return None
+
+
 def _compress_video(path: str) -> Optional[str]:
     """Reencode a video to land under Telegram's 50 MB bot limit. None on failure."""
     duration = _probe_duration(path)
@@ -156,10 +185,14 @@ async def _send_downloaded_item(update: Update, item: dict, caption: str):
     try:
         with open(path, "rb") as f:
             if item["type"] == "video":
+                meta = await asyncio.to_thread(_probe_video_meta, path) or {}
                 await update.message.reply_video(
                     f,
                     caption=caption,
                     supports_streaming=True,
+                    width=meta.get("width"),
+                    height=meta.get("height"),
+                    duration=meta.get("duration"),
                     read_timeout=600,
                     write_timeout=600,
                 )
