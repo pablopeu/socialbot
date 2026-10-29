@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Testea las instancias Invidious de YouTube desde donde corre el bot.
+"""Testea las rutas de descarga de YouTube desde donde corre el bot.
 
 Uso en el VPS, dentro del repo ya actualizado:
     python3 test_youtube_vps.py
@@ -69,6 +69,53 @@ def probe_download(url, referer):
         return type(e).__name__
 
 
+LOADERTO_API = "https://loader.to/ajax/download.php"
+
+
+def probe_loaderto():
+    """Pipeline completo de loader.to: acepta conversión → poll → primeros bytes.
+
+    Usa el formato que el bot elige para shorts ("4k": su tope de altura
+    preserva la resolución nativa vertical; "1080" daría 608x1080).
+    """
+    watch = f"https://www.youtube.com/watch?v={CANARY_ID}"
+    headers = {
+        "User-Agent": UA,
+        "Accept": "application/json",
+        "Referer": "https://loader.to/",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    try:
+        with httpx.Client(timeout=20, headers=headers, follow_redirects=True) as client:
+            started = time.monotonic()
+            r = client.get(LOADERTO_API, params={"format": "4k", "url": watch})
+            if r.status_code != 200:
+                return None, f"HTTP {r.status_code}: {r.text[:80]}"
+            progress_url = (r.json() or {}).get("progress_url")
+            if not progress_url:
+                return None, f"sin progress_url: {r.text[:80]}"
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline:
+                time.sleep(2)
+                p = client.get(progress_url).json()
+                if p.get("success") and p.get("download_url"):
+                    download_url = p["download_url"]
+                    break
+            else:
+                return None, "no terminó la conversión en 120s"
+            secs = time.monotonic() - started
+            head = client.get(
+                download_url,
+                headers={"User-Agent": UA, "Range": "bytes=0-2047"},
+            )
+            ct = head.headers.get("content-type", "?")
+            if head.status_code in (200, 206) and len(head.content) >= 512:
+                return f"{secs:.0f}s", f"HTTP {head.status_code} ct={ct}"
+            return None, f"descarga falló: HTTP {head.status_code} ct={ct}"
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
 def main():
     hosts = CANDIDATE_HOSTS
     if d is not None:
@@ -114,8 +161,19 @@ def main():
         if vdesc == "descargable" and adesc == "descargable":
             ok.append(host)
 
+    print("\n=== loader.to: conversión + descarga real ===")
+    secs, detail = probe_loaderto()
+    if secs:
+        print(f"  OK — conversión {secs}, mp4: {detail}")
+    else:
+        print(f"  FALLO — {detail}")
+
     print("\n=== RESUMEN ===")
     print(f"Instancias que resuelven Y descargan: {', '.join(ok) or 'ninguna'}")
+    if secs:
+        print("loader.to: FUNCIONA desde esta IP (ruta principal del bot)")
+    else:
+        print("loader.to: no funciona desde esta IP")
     if ok:
         print(
             "\nPara usarlas como lista del bot (orden por preferencia):\n"

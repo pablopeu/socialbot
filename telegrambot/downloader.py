@@ -135,6 +135,25 @@ YOUTUBE_HEALTH_CANARY = os.getenv(
 YOUTUBE_PROBE_TIMEOUT = float(
     os.getenv("SOCIALBOT_YOUTUBE_PROBE_TIMEOUT", "10")
 )
+# loader.to: acepta la URL solo como watch?v= y con headers de XHR; convierte
+# server-side y sirve un mp4 directo desde su storage (savenow.to). Sin key.
+YOUTUBE_LOADERTO_API_URL = os.getenv(
+    "SOCIALBOT_YOUTUBE_LOADERTO_API_URL",
+    "https://loader.to/ajax/download.php",
+)
+YOUTUBE_LOADERTO_FORMAT = os.getenv("SOCIALBOT_YOUTUBE_LOADERTO_FORMAT", "1080")
+# loader.to topea por ALTURA: en un short vertical 1080x1920 su "1080" entrega
+# 608x1080. "4k" (tope 2160) preserva la resolución nativa y el archivo sigue
+# siendo chico porque los shorts duran segundos. Solo para /shorts/.
+YOUTUBE_LOADERTO_SHORTS_FORMAT = os.getenv(
+    "SOCIALBOT_YOUTUBE_LOADERTO_SHORTS_FORMAT", "4k"
+)
+YOUTUBE_LOADERTO_POLL_SECONDS = float(
+    os.getenv("SOCIALBOT_YOUTUBE_LOADERTO_POLL_SECONDS", "2")
+)
+YOUTUBE_LOADERTO_MAX_WAIT = float(
+    os.getenv("SOCIALBOT_YOUTUBE_LOADERTO_MAX_WAIT", "120")
+)
 FFMPEG_BIN = shutil.which("ffmpeg")
 
 
@@ -180,6 +199,9 @@ def instagram_status() -> dict:
         "listnr_enabled": bool(INSTAGRAM_LISTNR_API_URL),
         "instapdown_enabled": bool(INSTAGRAM_INSTAPDOWN_API_URL),
         "youtube_invidious_hosts": list(YOUTUBE_INVIDIOUS_HOSTS),
+        "youtube_loaderto_enabled": bool(YOUTUBE_LOADERTO_API_URL),
+        "youtube_loaderto_format": YOUTUBE_LOADERTO_FORMAT,
+        "youtube_loaderto_shorts_format": YOUTUBE_LOADERTO_SHORTS_FORMAT,
         "probe_timeout_s": INSTAGRAM_PROBE_TIMEOUT,
         "health_check_time": (
             f"{INSTAGRAM_HEALTH_CHECK_HOUR:02d}:{INSTAGRAM_HEALTH_CHECK_MINUTE:02d}"
@@ -509,6 +531,42 @@ def _health_probe_yt_invidious(host: str) -> tuple:
     return (True, f"ok ({len(formats)} formatos)", latency_ms)
 
 
+def _health_probe_loaderto() -> tuple:
+    """Barato: pide una conversión del canario y solo verifica que la acepte."""
+    if not YOUTUBE_LOADERTO_API_URL:
+        return (False, "deshabilitado", None)
+    video_id = _yt_video_id_from_url(YOUTUBE_HEALTH_CANARY)
+    if not video_id:
+        return (False, "canario inválido", None)
+    try:
+        with httpx.Client(
+            follow_redirects=True, timeout=20
+        ) as client:
+            started = time.monotonic()
+            r = client.get(
+                YOUTUBE_LOADERTO_API_URL,
+                params={"format": "720", "url": _yt_canonical_url(video_id)},
+                headers={
+                    "User-Agent": BROWSER_HEADERS["User-Agent"],
+                    "Accept": "application/json",
+                    "Referer": f"https://{urlsplit(YOUTUBE_LOADERTO_API_URL).netloc}/",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+            )
+            latency_ms = int((time.monotonic() - started) * 1000)
+    except Exception as e:
+        return (False, _health_exc_reason(e), None)
+    if r.status_code != 200:
+        return (False, f"http {r.status_code}", None)
+    try:
+        accepted = bool((r.json() or {}).get("progress_url"))
+    except Exception:
+        return (False, "json inválido", None)
+    if not accepted:
+        return (False, "rechazó la conversión", None)
+    return (True, "ok (acepta conversiones)", latency_ms)
+
+
 def instagram_run_health_check() -> dict:
     """Sondea todos los métodos contra el post canario y persiste el estado del día."""
     canary = INSTAGRAM_HEALTH_CANARY_URL
@@ -519,6 +577,7 @@ def instagram_run_health_check() -> dict:
         "fastvidl": lambda: _health_probe_fastvidl(canary),
         "nuelink": lambda: _health_probe_nuelink(canary),
         "listnr": lambda: _health_probe_listnr(canary),
+        "loaderto": _health_probe_loaderto,
     }
     for host in INSTAGRAM_FIXER_HOSTS:
         probes[f"fixer:{host}"] = lambda host=host: _health_probe_fixer(host, canary)
@@ -1908,6 +1967,80 @@ def _yt_merge_av(video_path: str, audio_path: str) -> Optional[str]:
         return None
 
 
+def _yt_canonical_url(video_id: str) -> str:
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
+def _yt_download_via_loaderto(url: str, on_item=None) -> list:
+    """Descargar un video de YouTube vía loader.to (conversión server-side).
+
+    Primera ruta de fallback cuando yt-dlp directo está bot-checkeado: acepta
+    la URL como watch?v=, tarda ~30s en convertir y devuelve un mp4 ya
+    mergeado desde su storage. Sin API key ni cookies.
+    """
+    video_id = _yt_video_id_from_url(url)
+    if not video_id or not YOUTUBE_LOADERTO_API_URL:
+        return []
+    if not method_alive("loaderto"):
+        return []
+    fmt = YOUTUBE_LOADERTO_SHORTS_FORMAT if "/shorts/" in url else YOUTUBE_LOADERTO_FORMAT
+
+    referer = f"https://{urlsplit(YOUTUBE_LOADERTO_API_URL).netloc}/"
+    headers = {
+        "User-Agent": BROWSER_HEADERS["User-Agent"],
+        "Accept": "application/json",
+        "Referer": referer,
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    try:
+        with httpx.Client(timeout=20, headers=headers, follow_redirects=True) as client:
+            started = time.monotonic()
+            r = client.get(
+                YOUTUBE_LOADERTO_API_URL,
+                params={"format": fmt, "url": _yt_canonical_url(video_id)},
+            )
+            if r.status_code != 200:
+                logger.debug("loader.to HTTP %s", r.status_code)
+                if r.status_code >= 500:
+                    _mark_method_dead("loaderto", f"http {r.status_code}")
+                return []
+            progress_url = (r.json() or {}).get("progress_url")
+            if not progress_url:
+                logger.debug("loader.to respondió sin progress_url")
+                return []
+            deadline = time.monotonic() + YOUTUBE_LOADERTO_MAX_WAIT
+            download_url = None
+            while time.monotonic() < deadline:
+                time.sleep(YOUTUBE_LOADERTO_POLL_SECONDS)
+                progress = client.get(progress_url).json()
+                if progress.get("success") and progress.get("download_url"):
+                    download_url = progress["download_url"]
+                    break
+            if not download_url:
+                logger.info(
+                    "loader.to no terminó la conversión en %ds", int(YOUTUBE_LOADERTO_MAX_WAIT)
+                )
+                return []
+    except Exception as e:
+        logger.debug("loader.to request failed: %s", e)
+        _mark_method_dead("loaderto", _health_exc_reason(e))
+        return []
+
+    downloaded = _download_cdn_url(
+        download_url,
+        "video",
+        headers={"User-Agent": BROWSER_HEADERS["User-Agent"], "Referer": referer},
+    )
+    results = []
+    if downloaded:
+        _emit_downloaded_item(downloaded, results, on_item)
+        logger.info(
+            "YouTube media descargado vía loader.to (%.0fs de conversión)",
+            time.monotonic() - started,
+        )
+    return results
+
+
 def _yt_invidious_headers(host: str) -> dict:
     return {
         "User-Agent": BROWSER_HEADERS["User-Agent"],
@@ -2142,15 +2275,19 @@ def download_media(url: str, on_item=None) -> list:
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    # Invidious fallback para YouTube: yt-dlp directo falla con bot-check
-    # desde IPs de datacenter; las instancias proxeán el video.
+    # Fallbacks YouTube: yt-dlp directo falla con bot-check desde IPs de
+    # datacenter. Primero loader.to (convierte server-side, mp4 ya mergeado);
+    # después la cadena Invidious que proxeán el video.
     if is_youtube(url):
+        results = _yt_download_via_loaderto(url, on_item=on_item)
+        if results:
+            return results
         results = _yt_download_via_invidious(url, on_item=on_item)
         if results:
             return results
         raise DownloadError(
             "No pude descargar el video de YouTube: YouTube bloquea la IP de "
-            "esta VM y ninguna instancia de Invidious respondió. "
+            "esta VM y los servicios de descarga no respondieron. "
             "Probá de nuevo más tarde."
         )
 

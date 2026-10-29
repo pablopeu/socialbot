@@ -596,6 +596,9 @@ async def cmd_instagram_status(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     yt_hosts = ", ".join(status.get("youtube_invidious_hosts") or []) or "ninguna"
     lines.append(f"YouTube Invidious: {yt_hosts}")
+    lines.append(
+        f"Loader.to: {'off' if not status.get('youtube_loaderto_enabled') else status.get('youtube_loaderto_format') + 'p (shorts: ' + status.get('youtube_loaderto_shorts_format', '') + ')'}"
+    )
     lines.append(f"Timeout por método: {status['probe_timeout_s']:.0f}s")
     lines.append(f"Chequeo diario de salud: {status['health_check_time']} (Buenos Aires)")
     health = status.get("health", {})
