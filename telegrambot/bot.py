@@ -137,6 +137,8 @@ def _needs_compression(item: dict) -> bool:
 
 
 def _shrink_for_telegram(item: dict):
+    if not _needs_compression(item):
+        return
     path = item["path"]
     try:
         logger.info(
