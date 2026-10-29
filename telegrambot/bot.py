@@ -25,6 +25,7 @@ from downloader import (
     is_facebook,
     is_tiktok,
     is_threads,
+    is_youtube,
 )
 
 logging.basicConfig(
@@ -462,8 +463,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No tenés acceso. Contactate con el admin.")
         return
     await update.message.reply_text(
-        "Hola! Mandame un link de Instagram, Threads, Twitter/X, Facebook o TikTok "
-        "y te bajo las fotos y videos del post."
+        "Hola! Mandame un link de Instagram, Threads, Twitter/X, Facebook, TikTok "
+        "o YouTube (incluye Shorts) y te bajo las fotos y videos del post."
     )
 
 
@@ -657,9 +658,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = (update.message.text or "").strip()
-    if not (is_instagram(text) or is_twitter(text) or is_facebook(text) or is_tiktok(text) or is_threads(text)):
+    if not (is_instagram(text) or is_twitter(text) or is_facebook(text) or is_tiktok(text) or is_threads(text) or is_youtube(text)):
         await update.message.reply_text(
-            "Mandame un link de Instagram, Threads, Twitter/X, Facebook o TikTok."
+            "Mandame un link de Instagram, Threads, Twitter/X, Facebook, TikTok o YouTube."
         )
         return
 
@@ -671,6 +672,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         platform = "Facebook"
     elif is_tiktok(text):
         platform = "TikTok"
+    elif is_youtube(text):
+        platform = "YouTube"
     else:
         platform = "Twitter/X"
     logger.info(f"User {user.id} requested: {text}")

@@ -1,6 +1,6 @@
 # socialbot
 
-Bot de Telegram que descarga imágenes y videos de posts de **Instagram** y **Twitter/X** y los envía directamente al chat. No requiere APIs de pago ni cuentas de desarrollador.
+Bot de Telegram que descarga imágenes y videos de posts de **Instagram**, **Twitter/X**, **Facebook**, **TikTok**, **Threads** y **YouTube** (incluye Shorts) y los envía directamente al chat. No requiere APIs de pago ni cuentas de desarrollador.
 
 ## Arquitectura
 
@@ -141,9 +141,11 @@ https://www.instagram.com/reel/SHORTCODE/
 https://www.instagram.com/stories/usuario/1234567890/
 https://x.com/usuario/status/1234567890
 https://twitter.com/usuario/status/1234567890
+https://www.youtube.com/shorts/ID
+https://youtu.be/ID
 ```
 
-El bot responde con las fotos y/o videos del post. Soporta posts individuales, carousels y reels. Para Stories intenta métodos alternativos externos de Instagram; si la historia venció, es privada o ningún proveedor la expone públicamente, no se puede descargar sin sesión.
+El bot responde con las fotos y/o videos del post. Soporta posts individuales, carousels y reels. Para Stories intenta métodos alternativos externos de Instagram; si la historia venció, es privada o ningún proveedor la expone públicamente, no se puede descargar sin sesión. Los links de YouTube se bajan anónimos con yt-dlp (sin API key ni cookies); si YouTube empeza a pedir verificación desde la IP de la VM, actualizar yt-dlp suele resolverlo.
 
 Los usuarios no autorizados reciben: *"No tenés acceso. Contactate con el admin."*
 

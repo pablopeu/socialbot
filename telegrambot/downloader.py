@@ -592,6 +592,10 @@ def is_threads(url: str) -> bool:
     return "threads.net" in url or "threads.com" in url
 
 
+def is_youtube(url: str) -> bool:
+    return "youtube.com" in url or "youtu.be" in url
+
+
 def _is_direct(f: dict) -> bool:
     return (
         f.get("protocol", "") not in ("m3u8", "m3u8_native", "m3u8_local", "dash")
@@ -659,6 +663,13 @@ def _normalize_url(url: str) -> str:
     if ("instagram.com" in host or "instagr.am" in host) and re.search(
         r"/(?:p|reel|tv|stories/[^/]+)/[A-Za-z0-9_-]+/?$", path
     ):
+        return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+    # YouTube: el ID vive en el path en /shorts/ y youtu.be, así que el
+    # query (?feature=share, ?si=...) es tracking descartable. En /watch
+    # el ID está en el query y no se toca.
+    if "youtube.com" in host and re.search(r"/shorts/[A-Za-z0-9_-]+/?$", path):
+        return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+    if "youtu.be" in host and re.search(r"/[A-Za-z0-9_-]{11}/?$", path):
         return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
     return url
 
@@ -1802,6 +1813,18 @@ def download_media(url: str, on_item=None) -> list:
         "noprogress": True,
         "http_headers": YDL_HTTP_HEADERS,
     }
+
+    if is_youtube(url):
+        # YouTube ya casi no sirve formatos progresivos (video+audio en un
+        # solo archivo): hay que mergear video-only + audio-only con ffmpeg.
+        # H.264 + AAC en mp4 es lo que Telegram reproduce siempre. El cap es
+        # por ancho: en un short vertical 1080p es 1080x1920 (alto 1920).
+        ydl_opts["format"] = (
+            "bestvideo[vcodec^=avc1][width<=1080]+bestaudio[ext=m4a]/"
+            "bestvideo[width<=1080]+bestaudio/"
+            "best[ext=mp4][filesize<50M]/best[filesize<50M]/best"
+        )
+        ydl_opts["merge_output_format"] = "mp4"
 
     # Pick the right cookies file for the platform
     cookiefile = None
