@@ -121,8 +121,8 @@ YOUTUBE_INVIDIOUS_HOSTS = tuple(
     host.strip()
     for host in os.getenv(
         "SOCIALBOT_YOUTUBE_INVIDIOUS_HOSTS",
-        "yt.chocolatemoo53.com,inv.nadeko.net,invidious.jing.rocks,"
-        "iv.ggtyler.dev,iv.melmac.space,yt.drgnz.club,"
+        "invidious.schenkel.eti.br,yt.chocolatemoo53.com,inv.nadeko.net,"
+        "invidious.jing.rocks,iv.ggtyler.dev,iv.melmac.space,yt.drgnz.club,"
         "invidious.private.coffee,invidious.reallyaweso.me,"
         "invidious.perennialte.ch,invidious.protokolla.fi",
     ).split(",")

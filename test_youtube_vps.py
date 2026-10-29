@@ -33,11 +33,14 @@ CANARY_ID = "S41sbKiMBao"  # short público del pedido original
 # Lista amplia: las que respondan de acá definen el default del bot, pero
 # la red miente — la lista final la decide este script corrido en el VPS.
 CANDIDATE_HOSTS = [
-    "yt.chocolatemoo53.com", "inv.nadeko.net", "invidious.jing.rocks",
-    "iv.ggtyler.dev", "invidious.privacyredirect.com", "yt.artemislena.eu",
-    "iv.melmac.space", "invidious.private.coffee", "invidious.reallyaweso.me",
-    "yt.drgnz.club", "invidious.perennialte.ch", "iv.datura.network",
-    "invidious.fdn.fr", "invidious.protokolla.fi",
+    "invidious.schenkel.eti.br", "yt.chocolatemoo53.com", "inv.nadeko.net",
+    "invidious.jing.rocks", "iv.ggtyler.dev", "invidious.privacyredirect.com",
+    "yt.artemislena.eu", "iv.melmac.space", "invidious.private.coffee",
+    "invidious.reallyaweso.me", "yt.drgnz.club", "invidious.perennialte.ch",
+    "iv.datura.network", "invidious.fdn.fr", "invidious.protokolla.fi",
+    "yewtu.be", "invidious.f5.si", "invidious.nikkosphere.com",
+    "iv.duti.dev", "invidious.dhusch.de", "inv.tux.pizza",
+    "iv.catgirl.cloud", "invidious.materialio.us",
 ]
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
