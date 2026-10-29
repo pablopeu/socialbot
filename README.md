@@ -1,6 +1,6 @@
 # socialbot
 
-Bot de Telegram que descarga imágenes y videos de posts de **Instagram** y **Twitter/X** y los envía directamente al chat. No requiere APIs de pago ni cuentas de desarrollador.
+Bot de Telegram que descarga imágenes y videos de posts de **Instagram**, **Twitter/X**, **Facebook**, **TikTok**, **Threads** y **YouTube** (incluye Shorts) y los envía directamente al chat. No requiere APIs de pago ni cuentas de desarrollador.
 
 ## Arquitectura
 
@@ -87,11 +87,13 @@ Verificar que SSH funciona por ZeroTier antes de cerrar el puerto 22 público en
 
 ```bash
 sudo apt update && sudo apt upgrade -y
-sudo apt install python3-pip git -y
+sudo apt install python3-pip git ffmpeg -y
 git clone https://github.com/pablopeu/socialbot.git
 cd socialbot/telegrambot
 pip3 install -r requirements.txt
 ```
+
+`ffmpeg` es necesario para comprimir los videos que superan el límite de 50 MB de Telegram.
 
 ---
 
@@ -136,11 +138,14 @@ Mandar un link al bot en Telegram:
 ```
 https://www.instagram.com/p/SHORTCODE/
 https://www.instagram.com/reel/SHORTCODE/
+https://www.instagram.com/stories/usuario/1234567890/
 https://x.com/usuario/status/1234567890
 https://twitter.com/usuario/status/1234567890
+https://www.youtube.com/shorts/ID
+https://youtu.be/ID
 ```
 
-El bot responde con las fotos y/o videos del post. Soporta posts individuales, carousels y reels.
+El bot responde con las fotos y/o videos del post. Soporta posts individuales, carousels y reels. Para Stories intenta métodos alternativos externos de Instagram; si la historia venció, es privada o ningún proveedor la expone públicamente, no se puede descargar sin sesión. Los links de YouTube se bajan anónimos (sin API key ni cookies): primero intenta yt-dlp directo y, si YouTube bot-checkea la IP de la VM (lo normal en IPs de datacenter), cae a loader.to (servicio externo que convierte el video server-side y sirve un mp4 directo; configurable con `SOCIALBOT_YOUTUBE_LOADERTO_API_URL`, `SOCIALBOT_YOUTUBE_LOADERTO_FORMAT` —por defecto 1080— y `SOCIALBOT_YOUTUBE_LOADERTO_SHORTS_FORMAT` —por defecto 4k, que en shorts verticales preserva la resolución nativa 1080x1920—) y de ahí a una cadena de instancias Invidious que proxeán el video (lista con `SOCIALBOT_YOUTUBE_INVIDIOUS_HOSTS`). Todas las rutas se rankean/saltean solas con el health check diario. Para verificarlas desde la VM: `python3 test_youtube_vps.py`.
 
 Los usuarios no autorizados reciben: *"No tenés acceso. Contactate con el admin."*
 
@@ -178,9 +183,8 @@ Comandos Telegram para el admin:
 
 ## Notas
 
-- Instagram puede rate-limitar la IP de Oracle incluso sin usar una cuenta. Si falla, esperá y reintentá más tarde.
-- El bot activa un cooldown automático de 15 minutos después de un bloqueo de Instagram para no seguir golpeando la misma IP. Se puede cambiar con `SOCIALBOT_INSTAGRAM_COOLDOWN_SECONDS`.
-- Cuando el acceso directo a Instagram falla, el bot prueba una cadena de fixers externos. Se puede cambiar con `SOCIALBOT_INSTAGRAM_FIXER_HOSTS`.
+- Instagram puede rate-limitar la IP de Oracle incluso sin usar una cuenta.
+- Cuando el acceso directo a Instagram falla, el bot prueba una cadena de fixers externos. Para posts intenta reconstruir carousels consultando indices de imagen y deduplicando resultados; se puede cambiar el limite con `SOCIALBOT_INSTAGRAM_MAX_CAROUSEL_ITEMS`. Los fixers se pueden cambiar con `SOCIALBOT_INSTAGRAM_FIXER_HOSTS`. Para Stories también prueba Saveinsta; se puede cambiar con `SOCIALBOT_INSTAGRAM_SAVEINSTA_PAGE_URL`.
 - Si Instagram falla incluso después de probar todos los fixers, el bot avisa al admin configurado una sola vez por día.
 - El bot baja el ruido de logs HTTP de librerías externas; para diagnosticar Instagram usá `/instagram_status` y los logs propios del servicio.
 - Oracle Cloud Always Free no tiene límite de tiempo ni costo mientras se use el shape gratuito.

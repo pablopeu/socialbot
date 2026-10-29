@@ -10,3 +10,4 @@ telegrambot/threads_cookies.txt
 telegrambot/facebook_cookies.txt
 bot/config.php
 combined_bot.log
+telegrambot/instagram_health.json

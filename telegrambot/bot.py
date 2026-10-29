@@ -2,7 +2,9 @@ import asyncio
 import json
 import logging
 import os
+import queue
 import shutil
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -14,12 +16,16 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from downloader import (
     DownloadError,
     download_media,
+    instagram_health_stale,
+    instagram_run_health_check,
+    instagram_seconds_until_next_check,
     instagram_status,
     is_instagram,
     is_twitter,
     is_facebook,
     is_tiktok,
     is_threads,
+    is_youtube,
 )
 
 logging.basicConfig(
@@ -33,6 +39,274 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+TELEGRAM_CAPTION_LIMIT = 1024
+POST_TEXT_PREVIEW_LIMIT = 200
+
+TELEGRAM_VIDEO_LIMIT_BYTES = 49 * 1024 * 1024  # la Bot API rechaza archivos de más de 50 MB
+COMPRESS_TARGET_BYTES = 46 * 1024 * 1024
+FFMPEG_BIN = shutil.which("ffmpeg")
+FFPROBE_BIN = shutil.which("ffprobe")
+
+
+def _probe_duration(path: str) -> float:
+    result = subprocess.run(
+        [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True, timeout=60,
+    )
+    return float(result.stdout.strip())
+
+
+def _probe_video_meta(path: str) -> Optional[dict]:
+    """Width/height/duration del stream de video, o None si no se puede leer.
+
+    Telegram renderiza el reproductor según los width/height del mensaje;
+    sin ellos iOS muestra el video con el aspect ratio equivocado.
+    """
+    if not FFPROBE_BIN:
+        return None
+    try:
+        result = subprocess.run(
+            [FFPROBE_BIN, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height:format=duration",
+             "-of", "json", path],
+            capture_output=True, text=True, timeout=60,
+        )
+        meta = json.loads(result.stdout)
+        stream = next(iter(meta.get("streams") or []), None)
+        width, height = (stream or {}).get("width"), (stream or {}).get("height")
+        if not width or not height:
+            return None
+        out = {"width": int(width), "height": int(height)}
+        duration = (meta.get("format") or {}).get("duration")
+        if duration and float(duration) > 0:
+            out["duration"] = int(float(duration))
+        return out
+    except (subprocess.TimeoutExpired, ValueError, KeyError, json.JSONDecodeError):
+        return None
+
+
+def _compress_video(path: str) -> Optional[str]:
+    """Reencode a video to land under Telegram's 50 MB bot limit. None on failure."""
+    duration = _probe_duration(path)
+    if duration <= 0:
+        return None
+    video_bitrate = max(int(COMPRESS_TARGET_BYTES * 8 / duration) - 96_000, 40_000)
+    out_path = f"{path}.compressed.mp4"
+    passlog = f"{path}.passlog"
+    base = [
+        FFMPEG_BIN, "-y", "-i", path,
+        "-vf", "scale='min(1280,iw)':-2",
+        "-c:v", "libx264", "-preset", "veryfast", "-b:v", str(video_bitrate),
+        "-pix_fmt", "yuv420p",
+    ]
+    try:
+        subprocess.run(
+            base + ["-pass", "1", "-an", "-passlogfile", passlog, "-f", "mp4", "/dev/null"],
+            capture_output=True, timeout=900, check=True,
+        )
+        subprocess.run(
+            base + ["-pass", "2", "-passlogfile", passlog, "-c:a", "aac", "-b:a", "96k",
+                    "-movflags", "+faststart", out_path],
+            capture_output=True, timeout=900, check=True,
+        )
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
+        logger.warning(f"ffmpeg compression failed for {path}: {e}")
+        try:
+            os.unlink(out_path)
+        except FileNotFoundError:
+            pass
+        return None
+    finally:
+        for leftover in (f"{passlog}-0.log", f"{passlog}-0.log.mbtree"):
+            try:
+                os.unlink(leftover)
+            except FileNotFoundError:
+                pass
+    return out_path
+
+
+def _needs_compression(item: dict) -> bool:
+    return (
+        item.get("type") == "video"
+        and bool(FFMPEG_BIN and FFPROBE_BIN)
+        and os.path.getsize(item["path"]) > TELEGRAM_VIDEO_LIMIT_BYTES
+    )
+
+
+def _shrink_for_telegram(item: dict):
+    if not _needs_compression(item):
+        return
+    path = item["path"]
+    try:
+        logger.info(
+            f"Video de {os.path.getsize(path) / 1024 / 1024:.0f} MB supera el límite; comprimiendo..."
+        )
+        compressed = _compress_video(path)
+    except Exception as e:
+        logger.warning(f"No se pudo comprimir {path}: {e}")
+        return
+    if not compressed:
+        return
+    if os.path.getsize(compressed) <= TELEGRAM_VIDEO_LIMIT_BYTES:
+        os.unlink(path)
+        item["path"] = compressed
+        logger.info(
+            f"Video comprimido a {os.path.getsize(compressed) / 1024 / 1024:.0f} MB."
+        )
+    else:
+        os.unlink(compressed)
+        logger.warning("La compresión no bajó de 50 MB; el video queda por encima del límite.")
+
+
+def _caption_with_post_text(post_text: str, base_caption: str) -> str:
+    post_text = (post_text or "").strip()
+    if not post_text:
+        return base_caption
+    if len(post_text) > POST_TEXT_PREVIEW_LIMIT:
+        post_text = post_text[:POST_TEXT_PREVIEW_LIMIT].rstrip() + "…"
+    caption = f"{post_text}\n\n{base_caption}"
+    if len(caption) <= TELEGRAM_CAPTION_LIMIT:
+        return caption
+    budget = TELEGRAM_CAPTION_LIMIT - len(base_caption) - 4  # "\n\n" + "…"
+    if budget < 1:
+        return base_caption
+    return f"{post_text[:budget].rstrip()}…\n\n{base_caption}"
+
+
+async def _send_downloaded_item(update: Update, item: dict, caption: str):
+    notice = None
+    if _needs_compression(item):
+        notice = await update.message.reply_text(
+            "El video supera los 50 MB de Telegram; lo comprimo antes de mandarlo. "
+            "Puede tardar unos minutos."
+        )
+    await asyncio.to_thread(_shrink_for_telegram, item)
+    path = item["path"]
+    try:
+        with open(path, "rb") as f:
+            if item["type"] == "video":
+                meta = await asyncio.to_thread(_probe_video_meta, path) or {}
+                await update.message.reply_video(
+                    f,
+                    caption=caption,
+                    supports_streaming=True,
+                    width=meta.get("width"),
+                    height=meta.get("height"),
+                    duration=meta.get("duration"),
+                    read_timeout=600,
+                    write_timeout=600,
+                )
+            else:
+                await update.message.reply_photo(f, caption=caption)
+    finally:
+        if not item.get("_dir"):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+        if notice:
+            try:
+                await notice.delete()
+            except TelegramError:
+                pass
+
+
+async def _download_and_send_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, status):
+    user = update.effective_user
+    item_queue = queue.Queue()
+    done = object()
+    result = {"items": [], "error": None}
+
+    def on_item(item: dict):
+        item_queue.put(item)
+
+    def worker():
+        try:
+            result["items"] = download_media(text, on_item=on_item)
+        except Exception as e:
+            result["error"] = e
+        finally:
+            item_queue.put(done)
+
+    worker_task = asyncio.create_task(asyncio.to_thread(worker))
+    sent = 0
+    status_deleted = False
+    dirs_to_clean = set()
+
+    def cleanup_download_dirs():
+        for d in dirs_to_clean:
+            shutil.rmtree(d, ignore_errors=True)
+
+    while True:
+        item = await asyncio.to_thread(item_queue.get)
+        if item is done:
+            break
+
+        sent += 1
+        if item.get("_dir"):
+            dirs_to_clean.add(item["_dir"])
+        if not status_deleted:
+            try:
+                await status.delete()
+            except TelegramError:
+                pass
+            status_deleted = True
+
+        caption = f"{sent} - {text}" if sent > 1 else text
+        try:
+            await _send_downloaded_item(update, item, caption)
+        except TelegramError as e:
+            logger.error(f"Telegram error sending Instagram item {sent}: {e}")
+            await update.message.reply_text(
+                f"No pude enviar el archivo {sent}: el archivo puede ser demasiado grande (límite 50 MB)."
+            )
+        except Exception as e:
+            logger.error(f"Error sending Instagram item {sent}: {e}")
+            await update.message.reply_text(f"Error al enviar el archivo {sent}.")
+
+    await worker_task
+
+    if result["error"]:
+        if isinstance(result["error"], DownloadError):
+            err = result["error"]
+            logger.error(f"Download error for {text}: {err}")
+            await _maybe_notify_instagram_admin(
+                context,
+                user.id,
+                text,
+                str(err),
+                route_trace=getattr(err, "route_trace", ""),
+                route_key=getattr(err, "route_key", "instagram"),
+            )
+            if sent:
+                await update.message.reply_text(str(result["error"]))
+            else:
+                await status.edit_text(str(result["error"]))
+            cleanup_download_dirs()
+            return
+
+        logger.error(f"Error in download_media: {result['error']}")
+        if sent:
+            await update.message.reply_text("Error inesperado al descargar el contenido.")
+        else:
+            await status.edit_text("Error inesperado al descargar el contenido.")
+        cleanup_download_dirs()
+        return
+
+    if not sent:
+        await status.edit_text(
+            "No pude obtener el contenido de Instagram.\n"
+            "El post puede ser privado o el link inválido."
+        )
+        cleanup_download_dirs()
+        return
+
+    await _rearm_instagram_alert()
+    cleanup_download_dirs()
+    logger.info(f"Sent {sent} Instagram item(s) to user {user.id}")
 
 BASE_DIR = Path(__file__).parent
 CONFIG_PATH = BASE_DIR / "config.json"
@@ -81,21 +355,6 @@ def is_admin(user_id: int) -> bool:
     return user_id == get_admin_id()
 
 
-def _format_duration(seconds: int) -> str:
-    seconds = max(0, int(seconds))
-    minutes, secs = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours and minutes:
-        return f"{hours}h {minutes}m"
-    if hours:
-        return f"{hours}h"
-    if minutes and secs:
-        return f"{minutes}m {secs}s"
-    if minutes:
-        return f"{minutes}m"
-    return f"{secs}s"
-
-
 def _load_instagram_alert_state() -> dict:
     if not INSTAGRAM_ALERT_STATE_PATH.exists():
         return {}
@@ -117,7 +376,8 @@ def _save_instagram_alert_state(state: dict):
 
 def _should_notify_instagram_admin(error_text: str) -> bool:
     text = (error_text or "").lower()
-    return "inválido" not in text
+    ignored_errors = ("inválido", "historia de instagram")
+    return not any(error in text for error in ignored_errors)
 
 
 async def _maybe_notify_instagram_admin(
@@ -125,17 +385,32 @@ async def _maybe_notify_instagram_admin(
     requested_by: int,
     url: str,
     error_text: str,
+    route_trace: str = "",
+    route_key: str = "instagram",
 ):
+    """Notify the admin once per consecutive Instagram failure run.
+
+    Edge-triggered by `route_key`: the first time a given failure signature is
+    seen we send the alert and record it as active; subsequent identical
+    failures are suppressed. A successful download clears the active key via
+    `_rearm_instagram_alert`, so the next failure (even the same kind) notifies
+    again.
+    """
     admin_id = get_admin_id()
     if not admin_id or not _should_notify_instagram_admin(error_text):
         return
 
-    today = datetime.now().date().isoformat()
+    key = route_key or "instagram"
     async with INSTAGRAM_ALERT_LOCK:
         state = _load_instagram_alert_state()
-        if state.get("instagram_failure_alert_date") == today:
+        if state.get("active_failure_key") == key:
+            logger.info(
+                "Instagram: fallo consecutivo '%s', alerta ya enviada (suprimida).",
+                key,
+            )
             return
 
+        today = datetime.now().date().isoformat()
         message = (
             "Alerta Instagram: fallaron todas las rutas del bot para un link.\n"
             f"Fecha: {today}\n"
@@ -143,6 +418,8 @@ async def _maybe_notify_instagram_admin(
             f"URL: {url}\n"
             f"Error: {error_text}"
         )
+        if route_trace:
+            message += f"\nRutas: {route_trace}"
         try:
             await context.bot.send_message(
                 chat_id=admin_id,
@@ -153,11 +430,32 @@ async def _maybe_notify_instagram_admin(
             logger.error(f"Failed to send Instagram admin alert: {e}")
             return
 
-        state["instagram_failure_alert_date"] = today
-        state["instagram_failure_alert_url"] = url
-        state["instagram_failure_alert_error"] = error_text
-        state["instagram_failure_alert_requested_by"] = requested_by
+        state["active_failure_key"] = key
+        state["last_notified_at"] = datetime.now().isoformat(timespec="seconds")
+        for stale in (
+            "instagram_failure_alert_date",
+            "instagram_failure_alert_url",
+            "instagram_failure_alert_error",
+            "instagram_failure_alert_requested_by",
+        ):
+            state.pop(stale, None)
         _save_instagram_alert_state(state)
+
+
+async def _rearm_instagram_alert():
+    """Clear the active Instagram failure so the next failure notifies again.
+
+    Called whenever an Instagram download succeeds: a working request means the
+    earlier failure recovered on its own, so we rearm the alert.
+    """
+    async with INSTAGRAM_ALERT_LOCK:
+        state = _load_instagram_alert_state()
+        if not state.get("active_failure_key"):
+            return
+        state.pop("active_failure_key", None)
+        state["rearmed_at"] = datetime.now().isoformat(timespec="seconds")
+        _save_instagram_alert_state(state)
+        logger.info("Instagram se recuperó: alerta rearada.")
 
 
 # --- Handlers ---
@@ -167,8 +465,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No tenés acceso. Contactate con el admin.")
         return
     await update.message.reply_text(
-        "Hola! Mandame un link de Instagram, Threads, Twitter/X, Facebook o TikTok "
-        "y te bajo las fotos y videos del post."
+        "Hola! Mandame un link de Instagram, Threads, Twitter/X, Facebook, TikTok "
+        "o YouTube (incluye Shorts) y te bajo las fotos y videos del post."
     )
 
 
@@ -275,22 +573,89 @@ async def cmd_instagram_status(update: Update, context: ContextTypes.DEFAULT_TYP
     alert_state = _load_instagram_alert_state()
 
     lines = ["Estado Instagram:"]
-    if status["circuit_open"]:
-        lines.append(f"Cooldown: activo ({_format_duration(status['remaining_seconds'])})")
-    else:
-        lines.append("Cooldown: inactivo")
-    lines.append(f"Cooldown configurado: {status['cooldown_seconds']}s")
     fixers = ", ".join(status["fixer_hosts"]) if status["fixer_hosts"] else "ninguno"
     lines.append(f"Fixers: {fixers}")
+    lines.append(f"Max carousel fixer: {status['max_carousel_items']}")
     lines.append(
         f"Verificacion SSL fixers: {'on' if status['fixer_verify_ssl'] else 'off'}"
     )
-    if alert_state.get("instagram_failure_alert_date"):
-        lines.append(f"Ultima alerta admin: {alert_state['instagram_failure_alert_date']}")
+    lines.append(
+        f"Downreels: {'on' if status['downreels_enabled'] else 'off'}"
+    )
+    lines.append(
+        f"Fastvidl: {'on' if status['fastvidl_enabled'] else 'off'}"
+    )
+    lines.append(
+        f"Nuelink: {'on' if status['nuelink_enabled'] else 'off'}"
+    )
+    lines.append(
+        f"Listnr: {'on' if status['listnr_enabled'] else 'off'}"
+    )
+    lines.append(
+        f"Instapdown: {'on' if status['instapdown_enabled'] else 'off'}"
+    )
+    yt_hosts = ", ".join(status.get("youtube_invidious_hosts") or []) or "ninguna"
+    lines.append(f"YouTube Invidious: {yt_hosts}")
+    lines.append(
+        f"Loader.to: {'off' if not status.get('youtube_loaderto_enabled') else status.get('youtube_loaderto_format') + 'p (shorts: ' + status.get('youtube_loaderto_shorts_format', '') + ')'}"
+    )
+    lines.append(f"Timeout por método: {status['probe_timeout_s']:.0f}s")
+    lines.append(f"Chequeo diario de salud: {status['health_check_time']} (Buenos Aires)")
+    health = status.get("health", {})
+    if health.get("date"):
+        lines.append(f"Ultimo chequeo: {health.get('checked_at', health['date'])}")
+        for name in sorted(health.get("methods", {})):
+            record = health["methods"][name]
+            state_txt = "vivo" if record.get("alive") else "MUERTO"
+            latency = record.get("latency_ms")
+            latency_txt = f" ({latency} ms)" if record.get("alive") and isinstance(latency, int) else ""
+            lines.append(f"  {name}: {state_txt}{latency_txt} — {record.get('reason', '')}")
     else:
-        lines.append("Ultima alerta admin: ninguna")
+        lines.append("Chequeo de salud: sin datos (corre al iniciar o a la madrugada)")
+    if alert_state.get("active_failure_key"):
+        lines.append(f"Fallo activo: {alert_state['active_failure_key']}")
+        lines.append(f"Ultima alerta: {alert_state.get('last_notified_at', '?')}")
+    else:
+        lines.append("Fallo activo: ninguno (alerta armada)")
 
     await update.message.reply_text("\n".join(lines))
+
+
+# --- Chequeo diario de salud de métodos Instagram ---
+
+_HEALTH_LOOP_TASK = None
+
+
+async def _instagram_health_loop():
+    status = instagram_status()
+    logger.info(
+        "Loop de salud Instagram iniciado (chequeo diario a las %s hora Buenos Aires).",
+        status["health_check_time"],
+    )
+    while True:
+        try:
+            if instagram_health_stale():
+                logger.info("Instagram: chequeando salud de los métodos de descarga...")
+                state = await asyncio.to_thread(instagram_run_health_check)
+                methods = state.get("methods", {})
+                alive = [n for n, r in methods.items() if r.get("alive")]
+                logger.info(
+                    "Instagram salud: %d/%d métodos vivos.", len(alive), len(methods)
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"Instagram health check falló: {e}")
+            await asyncio.sleep(300)
+            continue
+        # Despierta a la madrugada del día siguiente, o antes si el estado
+        # quedó vencido (p. ej. tras un fallo total que invalidó el día).
+        await asyncio.sleep(min(instagram_seconds_until_next_check(), 1800))
+
+
+async def _start_instagram_health_loop(application: Application) -> None:
+    global _HEALTH_LOOP_TASK
+    _HEALTH_LOOP_TASK = asyncio.create_task(_instagram_health_loop())
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -300,9 +665,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = (update.message.text or "").strip()
-    if not (is_instagram(text) or is_twitter(text) or is_facebook(text) or is_tiktok(text) or is_threads(text)):
+    if not (is_instagram(text) or is_twitter(text) or is_facebook(text) or is_tiktok(text) or is_threads(text) or is_youtube(text)):
         await update.message.reply_text(
-            "Mandame un link de Instagram, Threads, Twitter/X, Facebook o TikTok."
+            "Mandame un link de Instagram, Threads, Twitter/X, Facebook, TikTok o YouTube."
         )
         return
 
@@ -314,18 +679,22 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         platform = "Facebook"
     elif is_tiktok(text):
         platform = "TikTok"
+    elif is_youtube(text):
+        platform = "YouTube"
     else:
         platform = "Twitter/X"
     logger.info(f"User {user.id} requested: {text}")
 
     status = await update.message.reply_text(f"Procesando tu link de {platform}...")
 
+    if is_instagram(text):
+        await _download_and_send_instagram(update, context, text, status)
+        return
+
     try:
         items = await asyncio.to_thread(download_media, text)
     except DownloadError as e:
         logger.error(f"Download error for {text}: {e}")
-        if is_instagram(text):
-            await _maybe_notify_instagram_admin(context, user.id, text, str(e))
         await status.edit_text(str(e))
         return
     except Exception as e:
@@ -347,22 +716,12 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for i, item in enumerate(items, 1):
         caption = f"{i}/{total} — {text}" if total > 1 else text
-        path = item["path"]
+        caption = _caption_with_post_text(item.get("post_text"), caption)
         if item.get("_dir"):
             dirs_to_clean.add(item["_dir"])
 
         try:
-            with open(path, "rb") as f:
-                if item["type"] == "video":
-                    await update.message.reply_video(
-                        f,
-                        caption=caption,
-                        supports_streaming=True,
-                        read_timeout=120,
-                        write_timeout=120,
-                    )
-                else:
-                    await update.message.reply_photo(f, caption=caption)
+            await _send_downloaded_item(update, item, caption)
         except TelegramError as e:
             logger.error(f"Telegram error sending item {i}: {e}")
             await update.message.reply_text(
@@ -371,12 +730,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Error sending item {i}: {e}")
             await update.message.reply_text(f"Error al enviar el archivo {i}.")
-        finally:
-            if not item.get("_dir"):
-                try:
-                    os.unlink(path)
-                except FileNotFoundError:
-                    pass
 
     for d in dirs_to_clean:
         shutil.rmtree(d, ignore_errors=True)
@@ -386,7 +739,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     token = load_token()
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).post_init(_start_instagram_health_loop).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("agregar", cmd_agregar))
     app.add_handler(CommandHandler("borrar", cmd_borrar))
