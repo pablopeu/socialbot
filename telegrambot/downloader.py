@@ -113,6 +113,29 @@ TWITTER_VXTWITTER_API_URL = os.getenv(
     "SOCIALBOT_TWITTER_VXTWITTER_API_URL",
     "https://api.vxtwitter.com/twitter/status/{id}",
 )
+# Instancias Invidious para YouTube: la API JSON resuelve los formatos y con
+# local=true la instancia proxea el video por su propio servidor, esquivando
+# el bot-check que YouTube le hace a la IP de la VM. La lista se rankea por
+# latencia en el health check diario y las muertas se saltean.
+YOUTUBE_INVIDIOUS_HOSTS = tuple(
+    host.strip()
+    for host in os.getenv(
+        "SOCIALBOT_YOUTUBE_INVIDIOUS_HOSTS",
+        "yt.chocolatemoo53.com,inv.nadeko.net,invidious.jing.rocks,"
+        "iv.ggtyler.dev,iv.melmac.space,yt.drgnz.club,"
+        "invidious.private.coffee,invidious.reallyaweso.me,"
+        "invidious.perennialte.ch,invidious.protokolla.fi",
+    ).split(",")
+    if host.strip()
+)
+YOUTUBE_HEALTH_CANARY = os.getenv(
+    "SOCIALBOT_YOUTUBE_HEALTH_CANARY",
+    "https://www.youtube.com/shorts/S41sbKiMBao",
+)
+YOUTUBE_PROBE_TIMEOUT = float(
+    os.getenv("SOCIALBOT_YOUTUBE_PROBE_TIMEOUT", "10")
+)
+FFMPEG_BIN = shutil.which("ffmpeg")
 
 
 class DownloadError(Exception):
@@ -156,6 +179,7 @@ def instagram_status() -> dict:
         "nuelink_enabled": bool(INSTAGRAM_NUELINK_API_URL),
         "listnr_enabled": bool(INSTAGRAM_LISTNR_API_URL),
         "instapdown_enabled": bool(INSTAGRAM_INSTAPDOWN_API_URL),
+        "youtube_invidious_hosts": list(YOUTUBE_INVIDIOUS_HOSTS),
         "probe_timeout_s": INSTAGRAM_PROBE_TIMEOUT,
         "health_check_time": (
             f"{INSTAGRAM_HEALTH_CHECK_HOUR:02d}:{INSTAGRAM_HEALTH_CHECK_MINUTE:02d}"
@@ -457,6 +481,34 @@ def _health_probe_listnr(canary: str) -> tuple:
     return (True, "ok", latency_ms)
 
 
+def _health_probe_yt_invidious(host: str) -> tuple:
+    video_id = _yt_video_id_from_url(YOUTUBE_HEALTH_CANARY)
+    if not video_id:
+        return (False, "canario inválido", None)
+    try:
+        with httpx.Client(
+            follow_redirects=True, timeout=YOUTUBE_PROBE_TIMEOUT
+        ) as client:
+            started = time.monotonic()
+            r = client.get(
+                f"https://{host}/api/v1/videos/{video_id}",
+                params={"fields": "adaptiveFormats", "local": "true"},
+                headers=_yt_invidious_headers(host),
+            )
+            latency_ms = int((time.monotonic() - started) * 1000)
+    except Exception as e:
+        return (False, _health_exc_reason(e), None)
+    if r.status_code != 200:
+        return (False, f"http {r.status_code}", None)
+    try:
+        formats = r.json().get("adaptiveFormats") or []
+    except Exception:
+        return (False, "json inválido", None)
+    if not formats:
+        return (False, "sin formatos", None)
+    return (True, f"ok ({len(formats)} formatos)", latency_ms)
+
+
 def instagram_run_health_check() -> dict:
     """Sondea todos los métodos contra el post canario y persiste el estado del día."""
     canary = INSTAGRAM_HEALTH_CANARY_URL
@@ -470,6 +522,9 @@ def instagram_run_health_check() -> dict:
     }
     for host in INSTAGRAM_FIXER_HOSTS:
         probes[f"fixer:{host}"] = lambda host=host: _health_probe_fixer(host, canary)
+    # YouTube comparte el mismo estado de salud (namespaced ytinvidious:*).
+    for host in YOUTUBE_INVIDIOUS_HOSTS:
+        probes[f"ytinvidious:{host}"] = lambda host=host: _health_probe_yt_invidious(host)
 
     methods = {}
     for name, probe in probes.items():
@@ -1782,6 +1837,207 @@ def _twitter_download_via_apis(url: str, on_item=None) -> list:
     return []
 
 
+def _yt_video_id_from_url(url: str) -> Optional[str]:
+    m = re.search(r"(?:youtube\.com|youtu\.be)", url)
+    if not m:
+        return None
+    m = re.search(r"youtu\.be/([A-Za-z0-9_-]{11})", url)
+    if m:
+        return m.group(1)
+    m = re.search(
+        r"youtube(?:-nocookie)?\.com/(?:shorts|embed|v|live)/([A-Za-z0-9_-]{11})", url
+    )
+    if m:
+        return m.group(1)
+    try:
+        values = parse_qs(urlsplit(url).query).get("v")
+        if values and re.fullmatch(r"[A-Za-z0-9_-]{11}", values[0]):
+            return values[0]
+    except Exception:
+        pass
+    return None
+
+
+def _yt_pick_invidious_formats(payload: dict) -> tuple:
+    """Elegir (video, audio) de los adaptiveFormats de Invidious.
+
+    Igual que con yt-dlp: no hay formatos progresivos, así que se bajan
+    video-only + audio-only y se mergean. Se prefiere H.264 + AAC en mp4
+    (lo que Telegram reproduce siempre) con ancho <=1080, que en un short
+    vertical es 1080x1920 completo.
+    """
+    entries = payload.get("adaptiveFormats") or []
+    videos = [
+        f for f in entries
+        if (f.get("type") or "").startswith("video/mp4")
+        and not (f.get("url") or "").endswith(".m3u8")
+    ]
+    fitting = [f for f in videos if int(f.get("width") or 0) <= 1080] or videos
+    avc = [f for f in fitting if "avc" in (f.get("type") or "")] or fitting
+    video = max(
+        avc, key=lambda f: (int(f.get("height") or 0), int(f.get("bitrate") or 0)),
+        default=None,
+    )
+    audios = [f for f in entries if (f.get("type") or "").startswith("audio/mp4")]
+    audio = max(
+        audios, key=lambda f: int(f.get("bitrate") or 0), default=None
+    )
+    return (video, audio)
+
+
+def _yt_merge_av(video_path: str, audio_path: str) -> Optional[str]:
+    """Mergear video-only + audio-only con ffmpeg sin reencodear."""
+    if not FFMPEG_BIN:
+        return None
+    fd, out_path = tempfile.mkstemp(suffix=".mp4", prefix="yt_merge_")
+    os.close(fd)
+    try:
+        subprocess.run(
+            [FFMPEG_BIN, "-y", "-i", video_path, "-i", audio_path,
+             "-map", "0:v:0", "-map", "1:a:0", "-c", "copy",
+             "-movflags", "+faststart", out_path],
+            capture_output=True, timeout=120, check=True,
+        )
+        return out_path
+    except Exception as e:
+        logger.debug("ffmpeg merge falló: %s", e)
+        try:
+            os.unlink(out_path)
+        except FileNotFoundError:
+            pass
+        return None
+
+
+def _yt_invidious_headers(host: str) -> dict:
+    return {
+        "User-Agent": BROWSER_HEADERS["User-Agent"],
+        "Accept": "application/json, */*",
+        "Referer": f"https://{host}/",
+    }
+
+
+def _yt_ranked_hosts() -> list:
+    hosts = list(YOUTUBE_INVIDIOUS_HOSTS)
+    state = _load_health_state()
+    if state.get("date") != _health_today():
+        return hosts
+    methods = state.get("methods", {})
+    default_idx = {host: i for i, host in enumerate(hosts)}
+
+    def host_key(host: str):
+        record = methods.get(f"ytinvidious:{host}")
+        if isinstance(record, dict) and record.get("alive"):
+            latency = record.get("latency_ms")
+            if isinstance(latency, int):
+                return (0, float(latency), default_idx[host])
+            return (1, 0.0, default_idx[host])
+        return (2, 0.0, default_idx[host])
+
+    return sorted(hosts, key=host_key)
+
+
+def _yt_download_via_invidious(url: str, on_item=None) -> list:
+    """Descargar un video de YouTube vía instancias Invidious (proxy propio).
+
+    Ruta para cuando yt-dlp directo falla (la IP de la VM está bot-checkeada):
+    la API JSON de Invidious resuelve los formatos y con local=true la misma
+    instancia sirve el archivo, así que el lock por IP de googlevideo no aplica.
+    """
+    video_id = _yt_video_id_from_url(url)
+    if not video_id:
+        return []
+
+    host_outcomes = []
+    for host in _yt_ranked_hosts():
+        if not method_alive(f"ytinvidious:{host}"):
+            host_outcomes.append(f"{host}=muerto hoy")
+            continue
+        try:
+            with httpx.Client(
+                follow_redirects=True, timeout=YOUTUBE_PROBE_TIMEOUT
+            ) as client:
+                started = time.monotonic()
+                r = client.get(
+                    f"https://{host}/api/v1/videos/{video_id}",
+                    params={"fields": "adaptiveFormats,formatStreams", "local": "true"},
+                    headers=_yt_invidious_headers(host),
+                )
+                latency_ms = int((time.monotonic() - started) * 1000)
+        except Exception as e:
+            logger.debug("Invidious %s request failed: %s", host, e)
+            _mark_method_dead(f"ytinvidious:{host}", _health_exc_reason(e))
+            host_outcomes.append(f"{host}=error (muerto hoy)")
+            continue
+
+        if r.status_code != 200:
+            if r.status_code >= 500:
+                _mark_method_dead(f"ytinvidious:{host}", f"http {r.status_code}")
+                host_outcomes.append(f"{host}=http {r.status_code} (muerto hoy)")
+            else:
+                host_outcomes.append(f"{host}=http {r.status_code}")
+            continue
+
+        try:
+            payload = r.json()
+        except Exception as e:
+            host_outcomes.append(f"{host}=json inválido")
+            logger.debug("Invidious %s bad JSON: %s", host, e)
+            continue
+        if payload.get("error") or not payload.get("adaptiveFormats"):
+            host_outcomes.append(f"{host}=sin formatos")
+            continue
+
+        video_fmt, audio_fmt = _yt_pick_invidious_formats(payload)
+        results = []
+        headers = {
+            "User-Agent": BROWSER_HEADERS["User-Agent"],
+            "Accept": "*/*",
+            "Referer": f"https://{host}/",
+        }
+
+        if video_fmt and audio_fmt and FFMPEG_BIN:
+            video_file = _download_cdn_url(video_fmt["url"], "video", headers=headers)
+            audio_file = _download_cdn_url(audio_fmt["url"], "video", headers=headers)
+            merged = None
+            if video_file and audio_file:
+                merged = _yt_merge_av(video_file["path"], audio_file["path"])
+            for part in (video_file, audio_file):
+                if part:
+                    try:
+                        os.unlink(part["path"])
+                    except FileNotFoundError:
+                        pass
+            if merged:
+                item = {"type": "video", "path": merged, "mime": "video/mp4"}
+                _emit_downloaded_item(item, results, on_item)
+                logger.info(
+                    "YouTube media descargado vía Invidious %s (%d ms de resolución)",
+                    host,
+                    latency_ms,
+                )
+                return results
+
+        # Sin ffmpeg (o merge fallido): formato progresivo 360p si existe.
+        progressive = (payload.get("formatStreams") or [None])[0]
+        if progressive and progressive.get("url"):
+            downloaded = _download_cdn_url(
+                progressive["url"], "video", headers=headers
+            )
+            if downloaded:
+                _emit_downloaded_item(downloaded, results, on_item)
+                logger.info(
+                    "YouTube media descargado vía Invidious %s (progresivo, sin merge)",
+                    host,
+                )
+                return results
+
+        host_outcomes.append(f"{host}=sin descarga ({len(payload.get('adaptiveFormats') or [])} formatos)")
+
+    summary = ", ".join(host_outcomes) if host_outcomes else "sin hosts"
+    logger.info(f"YouTube: Invidious no resolvió el video: {summary}")
+    return []
+
+
 def download_media(url: str, on_item=None) -> list:
     """
     Download all media from a URL.
@@ -1885,6 +2141,18 @@ def download_media(url: str, on_item=None) -> list:
         return results
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # Invidious fallback para YouTube: yt-dlp directo falla con bot-check
+    # desde IPs de datacenter; las instancias proxeán el video.
+    if is_youtube(url):
+        results = _yt_download_via_invidious(url, on_item=on_item)
+        if results:
+            return results
+        raise DownloadError(
+            "No pude descargar el video de YouTube: YouTube bloquea la IP de "
+            "esta VM y ninguna instancia de Invidious respondió. "
+            "Probá de nuevo más tarde."
+        )
 
     if instagram_error:
         instagram_trace.add("yt-dlp", "sin salida")

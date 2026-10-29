@@ -145,7 +145,7 @@ https://www.youtube.com/shorts/ID
 https://youtu.be/ID
 ```
 
-El bot responde con las fotos y/o videos del post. Soporta posts individuales, carousels y reels. Para Stories intenta métodos alternativos externos de Instagram; si la historia venció, es privada o ningún proveedor la expone públicamente, no se puede descargar sin sesión. Los links de YouTube se bajan anónimos con yt-dlp (sin API key ni cookies); si YouTube empeza a pedir verificación desde la IP de la VM, actualizar yt-dlp suele resolverlo.
+El bot responde con las fotos y/o videos del post. Soporta posts individuales, carousels y reels. Para Stories intenta métodos alternativos externos de Instagram; si la historia venció, es privada o ningún proveedor la expone públicamente, no se puede descargar sin sesión. Los links de YouTube se bajan anónimos (sin API key ni cookies): primero intenta yt-dlp directo y, si YouTube bot-checkea la IP de la VM (lo normal en IPs de datacenter), cae a una cadena de instancias Invidious que proxeán el video; la lista se cambia con `SOCIALBOT_YOUTUBE_INVIDIOUS_HOSTS` y se rankea/saltea sola con el health check diario. Para verificar instancias desde la VM: `python3 test_youtube_vps.py`.
 
 Los usuarios no autorizados reciben: *"No tenés acceso. Contactate con el admin."*
 

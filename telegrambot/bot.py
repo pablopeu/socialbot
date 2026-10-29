@@ -594,6 +594,8 @@ async def cmd_instagram_status(update: Update, context: ContextTypes.DEFAULT_TYP
     lines.append(
         f"Instapdown: {'on' if status['instapdown_enabled'] else 'off'}"
     )
+    yt_hosts = ", ".join(status.get("youtube_invidious_hosts") or []) or "ninguna"
+    lines.append(f"YouTube Invidious: {yt_hosts}")
     lines.append(f"Timeout por método: {status['probe_timeout_s']:.0f}s")
     lines.append(f"Chequeo diario de salud: {status['health_check_time']} (Buenos Aires)")
     health = status.get("health", {})
