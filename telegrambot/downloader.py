@@ -2129,8 +2129,19 @@ def _yt_download_via_invidious(url: str, on_item=None) -> list:
         }
 
         if video_fmt and audio_fmt and FFMPEG_BIN:
-            video_file = _download_cdn_url(video_fmt["url"], "video", headers=headers)
-            audio_file = _download_cdn_url(audio_fmt["url"], "video", headers=headers)
+            video_file, v_status = _download_cdn_url(
+                video_fmt["url"], "video", headers=headers, return_status=True
+            )
+            audio_file, a_status = _download_cdn_url(
+                audio_fmt["url"], "video", headers=headers, return_status=True
+            )
+            if not video_file or not audio_file:
+                logger.info(
+                    "Invidious %s: descarga de partes falló (video=%s audio=%s)",
+                    host,
+                    v_status if video_file else f"FALLO({v_status})",
+                    a_status if audio_file else f"FALLO({a_status})",
+                )
             merged = None
             if video_file and audio_file:
                 merged = _yt_merge_av(video_file["path"], audio_file["path"])
@@ -2153,9 +2164,13 @@ def _yt_download_via_invidious(url: str, on_item=None) -> list:
         # Sin ffmpeg (o merge fallido): formato progresivo 360p si existe.
         progressive = (payload.get("formatStreams") or [None])[0]
         if progressive and progressive.get("url"):
-            downloaded = _download_cdn_url(
-                progressive["url"], "video", headers=headers
+            downloaded, p_status = _download_cdn_url(
+                progressive["url"], "video", headers=headers, return_status=True
             )
+            if not downloaded:
+                logger.info(
+                    "Invidious %s: descarga progresiva falló (%s)", host, p_status
+                )
             if downloaded:
                 _emit_downloaded_item(downloaded, results, on_item)
                 logger.info(

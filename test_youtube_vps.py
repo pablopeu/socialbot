@@ -119,6 +119,48 @@ def probe_loaderto():
         return None, f"{type(e).__name__}: {e}"
 
 
+def probe_full_download(host):
+    """Descarga REAL (hasta 8MB) del formato elegido: mide throughput o el stall.
+
+    El probe de 2KB con Range pasa aunque el stream completo se cuelgue después;
+    esto expone cuánto tarda tirar del archivo de verdad desde esta IP.
+    """
+    try:
+        r = httpx.get(
+            f"https://{host}/api/v1/videos/{CANARY_ID}",
+            params={"fields": "adaptiveFormats,formatStreams", "local": "true"},
+            headers={"User-Agent": UA, "Accept": "application/json"},
+            timeout=TIMEOUT, follow_redirects=True,
+        )
+        payload = r.json()
+    except Exception as e:
+        return f"API: {type(e).__name__}"
+    video, _audio = pick_formats(payload)
+    if not video:
+        return "sin formato video"
+    url = video["url"]
+    got = 0
+    started = time.monotonic()
+    try:
+        with httpx.Client(timeout=httpx.Timeout(30, read=30), follow_redirects=True) as client:
+            with client.stream(
+                "GET", url, headers={"User-Agent": UA, "Referer": f"https://{host}/"}
+            ) as resp:
+                if resp.status_code != 200:
+                    return f"stream HTTP {resp.status_code}"
+                for chunk in resp.iter_bytes(65536):
+                    got += len(chunk)
+                    if got >= 8 * 1024 * 1024:
+                        break
+    except Exception as e:
+        elapsed = time.monotonic() - started
+        return f"{type(e).__name__} tras {elapsed:.0f}s con {got/1e6:.1f}MB"
+    elapsed = time.monotonic() - started
+    if got == 0:
+        return "0 bytes"
+    return f"{got/1e6:.1f}MB en {elapsed:.1f}s = {got/1e6/elapsed:.2f} MB/s"
+
+
 def main():
     hosts = CANDIDATE_HOSTS
     if d is not None:
@@ -163,6 +205,11 @@ def main():
         print(f"  {host:<32} {ms:>5}ms af={len(af):>3} fs={len(fs)} video({res}):{vdesc[:14]:<14} audio:{adesc[:14]}")
         if vdesc == "descargable" and adesc == "descargable":
             ok.append(host)
+
+    if ok:
+        print("\n=== Descarga REAL del formato elegido (hasta 8MB) ===")
+        for host in ok:
+            print(f"  {host:<32} {probe_full_download(host)}")
 
     print("\n=== loader.to: conversión + descarga real ===")
     secs, detail = probe_loaderto()
